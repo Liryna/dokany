@@ -16,7 +16,7 @@
 
   version: 1.1.0-{build}
   configuration:
-  - SonarQube
+    - SonarQube
 
   image:
     - Visual Studio 2017
@@ -149,7 +149,7 @@
       
         choco install "msbuild-sonarqube-runner" -y
         if ($env:APPVEYOR_PULL_REQUEST_NUMBER) {
-            MSBuild.SonarQube.Runner.exe begin /k:"dokany" /d:sonar.organization="dokan-dev" /d:sonar.host.url="https://sonarcloud.io" /d:sonar.login="094fffbd08033725384e461957a76f13c7ff5682" /d:"sonar.analysis.mode=preview" /d:"sonar.github.pullRequest=$env:APPVEYOR_PULL_REQUEST_NUMBER" /d:"sonar.github.repository=dokan-dev/dokany" /d:"sonar.github.oauth=$env:github_auth_token" }
+            MSBuild.SonarQube.Runner.exe begin /k:"dokany" /d:sonar.organization="dokan-dev" /d:sonar.host.url="https://sonarcloud.io" /d:sonar.login="094fffbd08033725384e461957a76f13c7ff5682" /d:"sonar.analysis.mode=preview" /d:"sonar.github.pullRequest=$env:APPVEYOR_PULL_REQUEST_NUMBER" /d:"sonar.github.repository=dokan-dev/dokany" /d:"sonar.github.oauth=$env:github_auth_token"
         } elseif (-Not $env:APPVEYOR_PULL_REQUEST_NUMBER) {
             MSBuild.SonarQube.Runner.exe begin /k:"dokany" /d:sonar.organization="dokan-dev" /d:sonar.host.url="https://sonarcloud.io" /d:sonar.login="094fffbd08033725384e461957a76f13c7ff5682"
         } else {
