@@ -149,17 +149,15 @@
         Add-Type -assembly system.io.compression.filesystem
         choco install "msbuild-sonarqube-runner" -y
         
-        [System.Net.ServicePointManager]::SecurityProtocol = @('Tls12','Tls11','Tls','Ssl3')
-        (new-object net.webclient).DownloadFile('https://sonarcloud.io/static/cpp/build-wrapper-win-x86.zip', $PSScriptRoot + '\BuildWrapper.zip')
-        [io.compression.zipfile]::ExtractToDirectory($PSScriptRoot + '\BuildWrapper.zip', $PSScriptRoot + '\BuildWrapper')
-        
         if ($env:APPVEYOR_PULL_REQUEST_NUMBER) {
             MSBuild.SonarQube.Runner.exe begin /k:"dokany" /d:sonar.organization="dokan-dev" /d:sonar.cfamily.build-wrapper-output=bw-output /d:sonar.host.url="https://sonarcloud.io" /d:sonar.login="094fffbd08033725384e461957a76f13c7ff5682" /d:"sonar.analysis.mode=preview" /d:"sonar.github.pullRequest=$env:APPVEYOR_PULL_REQUEST_NUMBER" /d:"sonar.github.repository=dokan-dev/dokany" /d:"sonar.github.oauth=$env:github_auth_token"
         } elseif (-Not $env:APPVEYOR_PULL_REQUEST_NUMBER) {
             MSBuild.SonarQube.Runner.exe begin /k:"dokany" /d:sonar.organization="dokan-dev" /d:sonar.cfamily.build-wrapper-output=bw-output /d:sonar.host.url="https://sonarcloud.io" /d:sonar.login="094fffbd08033725384e461957a76f13c7ff5682"
-        } else {
-            Add-AppveyorMessage -Message "Not running SonarQube. Is this a fork?" -Category Information
         }
+        
+        [System.Net.ServicePointManager]::SecurityProtocol = @('Tls12','Tls11','Tls','Ssl3')
+        (new-object net.webclient).DownloadFile('https://sonarcloud.io/static/cpp/build-wrapper-win-x86.zip', '.\BuildWrapper.zip')
+        [io.compression.zipfile]::ExtractToDirectory('.\BuildWrapper.zip', '.\BuildWrapper')
         
         $buildArgs = @(
         "dokan.sln",
