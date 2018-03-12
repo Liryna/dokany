@@ -159,13 +159,15 @@
         (new-object net.webclient).DownloadFile('https://sonarcloud.io/static/cpp/build-wrapper-win-x86.zip', '.\BuildWrapper.zip')
         [io.compression.zipfile]::ExtractToDirectory('.\BuildWrapper.zip', '.\BuildWrapper')
         
+        Invoke-WebRequest https://sonarcloud.io/static/cpp/build-wrapper-win-x86.zip -OutFile .\build-wrapper-win-x86.zip
+        & 7z e .\build-wrapper-win-x86.zip
+        
         $buildArgs = @(
         "dokan.sln",
         "/p:Configuration=Win10 Debug",
         "/p:Platform=x64")
         
-        ls .\BuildWrapper -recurse
-        Invoke-Expression ".\BuildWrapper\build-wrapper-win-x86\build-wrapper-win-x86-64.exe MSBuild.exe $buildArgs"
+        Invoke-Expression ".\build-wrapper-win-x86\build-wrapper-win-x86-64.exe MSBuild.exe $buildArgs"
         
         MSBuild.SonarQube.Runner.exe end /d:"sonar.login=094fffbd08033725384e461957a76f13c7ff5682"
       }
