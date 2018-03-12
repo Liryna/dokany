@@ -162,7 +162,9 @@
         Invoke-WebRequest https://sonarcloud.io/static/cpp/build-wrapper-win-x86.zip -OutFile .\build-wrapper-win-x86.zip
         & 7z e .\build-wrapper-win-x86.zip
                
-        Invoke-Expression ".\build-wrapper-win-x86-64.exe --out-dir bw_output msbuild dokan.sln /m /p:Configuration='Win10 Debug' /p:Platform=x64"
+        Invoke-Expression ".\build-wrapper-win-x86-64.exe --out-dir bw-output msbuild dokan.sln /m /p:Configuration='Win10 Debug' /p:Platform=x64"
+        
+        ls -Recurse
         
         MSBuild.SonarQube.Runner.exe end /d:"sonar.login=094fffbd08033725384e461957a76f13c7ff5682"
       }
