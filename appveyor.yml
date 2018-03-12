@@ -20,7 +20,6 @@
 
   image:
     - Visual Studio 2017
-    - Visual Studio 2015
 # If you suspect some changes on the AppVeyor-side breaking things,
 # uncomment below. https://www.appveyor.com/updates/
 #    - Previous Visual Studio 2015
@@ -157,12 +156,11 @@
         }
         
         $buildArgs = @(
-        "/m",
-        "/l:C:\Program Files\AppVeyor\BuildAgent\Appveyor.MSBuildLogger.dll",
+        "dokan.sln",
         "/p:Configuration=Win10 Debug",
         "/p:Platform=x64")
 
-        Exec-External {& $buildCmd $buildArgs}
+        & $buildCmd $buildArgs
         
         MSBuild.SonarQube.Runner.exe end /d:"sonar.login=094fffbd08033725384e461957a76f13c7ff5682"
       }
