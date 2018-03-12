@@ -167,9 +167,7 @@
         "/p:Configuration=Win10 Debug",
         "/p:Platform=x64")
         
-        ls . -recurse
-        
-        Invoke-Expression ".\build-wrapper-win-x86\build-wrapper-win-x86-64.exe MSBuild.exe $buildArgs"
+        Invoke-Expression ".\build-wrapper-win-x86-64.exe MSBuild.exe $buildArgs"
         
         MSBuild.SonarQube.Runner.exe end /d:"sonar.login=094fffbd08033725384e461957a76f13c7ff5682"
       }
