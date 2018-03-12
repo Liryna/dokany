@@ -146,6 +146,7 @@
   - ps: |
       if ($env:CONFIGURATION -eq "SonarQube") {
       
+        Add-Type -assembly system.io.compression.filesystem
         choco install "msbuild-sonarqube-runner" -y
         
         [System.Net.ServicePointManager]::SecurityProtocol = @('Tls12','Tls11','Tls','Ssl3')
