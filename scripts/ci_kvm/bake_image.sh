@@ -155,7 +155,7 @@ cat > "$SEED_DIR/autounattend.xml" <<EOF
       <FirstLogonCommands>
         <SynchronousCommand wcm:action="add">
           <Order>1</Order>
-          <CommandLine>cmd /c "for %i in (D E F G H) do if exist %i:\setup-guest.ps1 (powershell -NoProfile -ExecutionPolicy Bypass -File %i:\setup-guest.ps1 %i: > COM1: 2>&1 || shutdown /s /t 5)"</CommandLine>
+          <CommandLine>cmd /c "for %i in (D E F G H) do if exist %i:\run-bake.cmd call %i:\run-bake.cmd %i:"</CommandLine>
           <Description>Provision Dokan CI guest image</Description>
         </SynchronousCommand>
       </FirstLogonCommands>
@@ -234,7 +234,11 @@ try {
     New-Item -ItemType Directory -Force -Path $sshDest | Out-Null
     Expand-Archive -Path "$localSeed\OpenSSH-Win64.zip" -DestinationPath 'C:\Windows\Temp\openssh-extract' -Force
     $inner = Get-ChildItem 'C:\Windows\Temp\openssh-extract' -Directory | Select-Object -First 1
-    Copy-Item -Path "$($inner.FullName)\*" -Destination $sshDest -Recurse -Force
+    if ($inner) {
+        Copy-Item -Path "$($inner.FullName)\*" -Destination $sshDest -Recurse -Force
+    } else {
+        Copy-Item -Path 'C:\Windows\Temp\openssh-extract\*' -Destination $sshDest -Recurse -Force
+    }
     Remove-Item 'C:\Windows\Temp\openssh-extract' -Recurse -Force
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$sshDest\install-sshd.ps1"
     Set-Service sshd -StartupType Automatic
@@ -293,17 +297,26 @@ try {
         }
     }
 
-    Log "BAKE_SUCCESS: Shutting down cleanly..."
-    Start-Sleep -Seconds 2
-    & shutdown.exe /s /t 0
+    Log "BAKE_SUCCESS: Provisioning finished."
+    exit 0
 } catch {
     Log "BAKE_FAILED: $($_.Exception.Message)"
     Log ($_.ScriptStackTrace | Out-String)
-    Start-Sleep -Seconds 3
-    & shutdown.exe /s /t 0
+    exit 1
 }
 PSEOF
 
+cat > "$SEED_DIR/run-bake.cmd" <<'CMDEOF'
+@echo off
+echo [run-bake.cmd] Starting setup-guest.ps1 from %1 > COM1:
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File %1\setup-guest.ps1 %1 > COM1: 2>&1
+set RC=%ERRORLEVEL%
+echo [run-bake.cmd] setup-guest.ps1 exited with RC=%RC% > COM1:
+shutdown.exe /s /t 2
+CMDEOF
+sed -i 's/$/\r/' "$SEED_DIR/run-bake.cmd"
+
+python3 -c "import xml.etree.ElementTree as ET; ET.parse('$SEED_DIR/autounattend.xml')"
 genisoimage -quiet -J -r -V "DOKANSEED" -o "$WORK_DIR/seed.iso" "$SEED_DIR"
 
 echo "=== [$(date -u +%T)] Creating 20G raw qcow2 disk ==="
@@ -319,6 +332,7 @@ TAIL_PID=$!
 trap 'kill $TAIL_PID 2>/dev/null || true' EXIT
 
 # Timeout at 20 minutes so a stuck install never hangs the runner
+set +e
 timeout 1200 qemu-system-x86_64 \
   -enable-kvm \
   -machine q35,accel=kvm \
@@ -337,13 +351,15 @@ timeout 1200 qemu-system-x86_64 \
   -netdev user,id=net0 \
   -device e1000e,netdev=net0 \
   -boot order=dc
+QEMU_RC=$?
+set -e
 
 kill "$TAIL_PID" 2>/dev/null || true
 T_END=$(date +%s)
-echo "=== [$(date -u +%T)] QEMU exited after $((T_END - T_BOOT))s ==="
+echo "=== [$(date -u +%T)] QEMU exited (rc=$QEMU_RC) after $((T_END - T_BOOT))s ==="
 
-if ! grep -q "BAKE_SUCCESS" "$SERIAL_LOG"; then
-  echo "ERROR: BAKE_SUCCESS marker not found in serial log!" >&2
+if [[ $QEMU_RC -ne 0 ]] || ! grep -q "BAKE_SUCCESS" "$SERIAL_LOG"; then
+  echo "ERROR: Bake failed (qemu rc=$QEMU_RC) or BAKE_SUCCESS marker not found!" >&2
   cat "$SERIAL_LOG" >&2
   exit 1
 fi
