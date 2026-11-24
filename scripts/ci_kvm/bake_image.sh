@@ -40,12 +40,12 @@ chmod 600 "$OUT_DIR/id_ed25519"
 
 echo "=== [$(date -u +%T)] Downloading Windows Evaluation ISO ($OS_ID) ==="
 T0=$(date +%s)
-curl -fSL --retry 3 --retry-delay 5 -o "$WORK_DIR/windows.iso" "$ISO_URL"
+curl -fsSL --retry 3 --retry-delay 5 -o "$WORK_DIR/windows.iso" "$ISO_URL"
 T1=$(date +%s)
 echo "Downloaded windows.iso ($(du -h "$WORK_DIR/windows.iso" | awk '{print $1}')) in $((T1 - T0))s"
 
 echo "=== [$(date -u +%T)] Downloading Win32-OpenSSH ==="
-curl -fSL --retry 3 --retry-delay 5 -o "$WORK_DIR/OpenSSH-Win64.zip" "$OPENSSH_URL"
+curl -fsSL --retry 3 --retry-delay 5 -o "$WORK_DIR/OpenSSH-Win64.zip" "$OPENSSH_URL"
 
 echo "=== [$(date -u +%T)] Building seed ISO (autounattend.xml + setup-guest.ps1) ==="
 SEED_DIR="$WORK_DIR/seed"
@@ -203,10 +203,17 @@ try {
         } catch { }
     }
 
-    # 2. Import Dokan test CA certificate
+    # Copy seed files to local writable temp dir before using them
+    $localSeed = 'C:\Windows\Temp\seed'
+    New-Item -ItemType Directory -Force -Path $localSeed | Out-Null
+    Copy-Item -Path "$SeedDrive\*" -Destination $localSeed -Recurse -Force
+
+    # 2. Import Dokan test CA certificate (certutil works reliably on headless Server Core)
     Log "Importing DokanCA.cer..."
-    Import-Certificate -FilePath "$SeedDrive\DokanCA.cer" -CertStoreLocation 'Cert:\LocalMachine\Root' | Out-Null
-    Import-Certificate -FilePath "$SeedDrive\DokanCA.cer" -CertStoreLocation 'Cert:\LocalMachine\TrustedPublisher' | Out-Null
+    & certutil.exe -addstore -f Root "$localSeed\DokanCA.cer" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "certutil Root failed: $LASTEXITCODE" }
+    & certutil.exe -addstore -f TrustedPublisher "$localSeed\DokanCA.cer" | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "certutil TrustedPublisher failed: $LASTEXITCODE" }
 
     # 3. Enable TESTSIGNING and pre-arm Driver Verifier for dokan3.sys
     Log "Enabling TESTSIGNING and Driver Verifier for dokan3.sys..."
@@ -225,11 +232,11 @@ try {
     # Ensure pagefile is large enough on C: for kernel memory dump
     Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' -Name 'PagingFiles' -Type MultiString -Value @('C:\pagefile.sys 2048 4096')
 
-    # 5. Install Win32-OpenSSH from seed ISO
+    # 5. Install Win32-OpenSSH from local seed copy
     Log "Installing Win32-OpenSSH..."
     $sshDest = 'C:\Program Files\OpenSSH'
     New-Item -ItemType Directory -Force -Path $sshDest | Out-Null
-    Expand-Archive -Path "$SeedDrive\OpenSSH-Win64.zip" -DestinationPath 'C:\Windows\Temp\openssh-extract' -Force
+    Expand-Archive -Path "$localSeed\OpenSSH-Win64.zip" -DestinationPath 'C:\Windows\Temp\openssh-extract' -Force
     $inner = Get-ChildItem 'C:\Windows\Temp\openssh-extract' -Directory | Select-Object -First 1
     Copy-Item -Path "$($inner.FullName)\*" -Destination $sshDest -Recurse -Force
     Remove-Item 'C:\Windows\Temp\openssh-extract' -Recurse -Force
@@ -242,7 +249,7 @@ try {
     $sshData = 'C:\ProgramData\ssh'
     New-Item -ItemType Directory -Force -Path $sshData | Out-Null
     $authKeys = "$sshData\administrators_authorized_keys"
-    Copy-Item -LiteralPath "$SeedDrive\authorized_keys" -Destination $authKeys -Force
+    Copy-Item -LiteralPath "$localSeed\authorized_keys" -Destination $authKeys -Force
     & icacls.exe $authKeys /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F" | Out-Null
 
     # Set PowerShell as default SSH shell and open firewall port 22
@@ -256,9 +263,10 @@ try {
 
     Log "Installing WLK/HLK IFSTest..."
     $env:WLK_INST_CACHE = 'C:\Windows\Temp\wlk_inst'
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$SeedDrive\install_wlk_ifstest.ps1"
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$localSeed\install_wlk_ifstest.ps1"
     if ($LASTEXITCODE -ne 0) { throw "install_wlk_ifstest.ps1 failed: $LASTEXITCODE" }
     Remove-Item -Path 'C:\Windows\Temp\wlk_inst' -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -Path $localSeed -Recurse -Force -ErrorAction SilentlyContinue
 
     # 7. Shrink disk before shutdown so zstd qcow2 compresses cleanly
     Log "Cleaning temp files and zeroing free space for compression..."

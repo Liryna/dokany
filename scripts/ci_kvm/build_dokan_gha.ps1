@@ -28,8 +28,8 @@ if (!(Test-Path -Path '.\packages\Microsoft.Windows.WDK.x64.*')) {
 
 # 3. Compute version matching AppVeyor convention
 $xmlversion = [xml](Get-Content "$repoRoot\dokan_wix\version.xml")
-$baseVersion = ($xmlversion.Include.define | Where-Object { $_.StartsWith('BaseVersion=') }).Split('=')[1] -replace '"', ''
-$buildVerDef = ($xmlversion.Include.define | Where-Object { $_.StartsWith('BuildVersion=') }).Split('=')[1] -replace '"', ''
+$baseVersion = (($xmlversion.Include.define | Where-Object { $_.StartsWith('BaseVersion=') }).Split('=')[1] -replace '"', '').Trim()
+$buildVerDef = (($xmlversion.Include.define | Where-Object { $_.StartsWith('BuildVersion=') }).Split('=')[1] -replace '"', '').Trim()
 $paddedBuild = $BuildNumber.Trim()
 if ($paddedBuild.Length -lt $buildVerDef.Length) {
     $mmVersion = $buildVerDef.Substring(0, $buildVerDef.Length - $paddedBuild.Length) + $paddedBuild
