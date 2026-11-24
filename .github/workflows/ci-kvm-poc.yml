@@ -52,6 +52,7 @@ jobs:
       matrix:
         os:
           - server2025
+          - server2022
     steps:
       - name: Checkout dokany
         uses: actions/checkout@v7
@@ -90,6 +91,7 @@ jobs:
       matrix:
         os:
           - server2025
+          - server2022
     steps:
       - name: Checkout dokany
         uses: actions/checkout@v7

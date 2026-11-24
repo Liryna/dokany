@@ -245,16 +245,36 @@ try {
     Start-Service sshd
     Start-Sleep -Seconds 2
 
-    # Configure authorized_keys for Administrators
+    # Configure sshd_config (disable UseDNS so restrict=on isolated NAT never stalls banner exchange)
     $sshData = 'C:\ProgramData\ssh'
     New-Item -ItemType Directory -Force -Path $sshData | Out-Null
+    $sshdCfg = "$sshData\sshd_config"
+    if (Test-Path -LiteralPath $sshdCfg) {
+        $cfgText = Get-Content -LiteralPath $sshdCfg -Raw
+        if ($cfgText -notmatch '(?m)^UseDNS\s+no') {
+            $cfgText = "UseDNS no`r`n" + $cfgText
+        }
+        [System.IO.File]::WriteAllText($sshdCfg, $cfgText, (New-Object System.Text.UTF8Encoding($false)))
+    }
+
+    # Configure authorized_keys for Administrators
     $authKeys = "$sshData\administrators_authorized_keys"
     Copy-Item -LiteralPath "$localSeed\authorized_keys" -Destination $authKeys -Force
     & icacls.exe $authKeys /inheritance:r /grant "Administrators:F" /grant "SYSTEM:F" | Out-Null
 
-    # Set PowerShell as default SSH shell and open firewall port 22
+    # Set PowerShell as default SSH shell and open firewall port 22 on ALL profiles (unique rule name!)
     New-ItemProperty -Path 'HKLM:\SOFTWARE\OpenSSH' -Name 'DefaultShell' -Value 'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe' -PropertyType String -Force | Out-Null
-    New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 -ErrorAction SilentlyContinue | Out-Null
+    & netsh.exe advfirewall firewall add rule name="DokanCI-SSH-In" dir=in action=allow protocol=TCP localport=22 profile=any
+    if ($LASTEXITCODE -ne 0) { throw "netsh advfirewall add rule failed: $LASTEXITCODE" }
+
+    Restart-Service sshd
+    Start-Sleep -Seconds 3
+    $sshdSvc = Get-Service sshd
+    Log "sshd service status: $($sshdSvc.Status)"
+    if ($sshdSvc.Status -ne 'Running') { throw "sshd is not running: $($sshdSvc.Status)" }
+    $listening = & netstat.exe -ano | Select-String ':22\s'
+    Log "netstat port 22: $($listening -join ' | ')"
+    if (-not $listening) { throw "sshd is not listening on port 22!" }
 
     # 6. Create dokan_ifstest user & install HLK IFSTest
     Log "Creating dokan_ifstest user..."

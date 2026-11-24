@@ -28,7 +28,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "=== [$(date -u +%T)] Booting KVM guest ==="
+echo "=== [$(date -u +%T)] Booting network-isolated KVM guest (restrict=on) ==="
 T_BOOT0=$(date +%s)
 qemu-system-x86_64 \
   -enable-kvm \
@@ -43,7 +43,7 @@ qemu-system-x86_64 \
   -device ahci,id=ahci \
   -drive "file=${OVERLAY_IMG},format=qcow2,if=none,id=hd0,cache=writeback" \
   -device ide-hd,drive=hd0,bus=ahci.0 \
-  -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 \
+  -netdev user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:2222-:22 \
   -device e1000e,netdev=net0 &
 QEMU_PID=$!
 
