@@ -155,7 +155,7 @@ cat > "$SEED_DIR/autounattend.xml" <<EOF
       <FirstLogonCommands>
         <SynchronousCommand wcm:action="add">
           <Order>1</Order>
-          <CommandLine>cmd /c "for %i in (D E F G H) do if exist %i:\setup-guest.ps1 powershell -NoProfile -ExecutionPolicy Bypass -File %i:\setup-guest.ps1 %i:"</CommandLine>
+          <CommandLine>cmd /c "for %i in (D E F G H) do if exist %i:\setup-guest.ps1 (powershell -NoProfile -ExecutionPolicy Bypass -File %i:\setup-guest.ps1 %i: > COM1: 2>&1 || shutdown /s /t 5)"</CommandLine>
           <Description>Provision Dokan CI guest image</Description>
         </SynchronousCommand>
       </FirstLogonCommands>
@@ -177,13 +177,7 @@ $logFile = 'C:\ci-bake.log'
 function Log($msg) {
     $line = "[$(Get-Date -Format 'HH:mm:ss')] $msg"
     Add-Content -Path $logFile -Value $line
-    Write-Host $line
-    try {
-        $port = New-Object System.IO.Ports.SerialPort 'COM1', 115200, 'None', 8, 'One'
-        $port.Open()
-        $port.WriteLine($line)
-        $port.Close()
-    } catch { }
+    Write-Output $line
 }
 
 try {
@@ -221,7 +215,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "bcdedit testsigning failed: $LASTEXITCODE" }
     $vOut = (& verifier.exe /standard /driver dokan3.sys 2>&1 | Out-String).Trim()
     # verifier.exe exit code 2 = EXIT_CODE_REBOOT_REQUIRED (success; changes take effect on next boot)
-    Log "verifier exit=$LASTEXITCODE: $vOut"
+    Log "verifier exit=${LASTEXITCODE}: $vOut"
     if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 2) { throw "verifier config failed: $LASTEXITCODE" }
 
     # 4. Configure Kernel Memory Dump (CrashDumpEnabled=2 -> C:\Windows\MEMORY.DMP) + AutoReboot
@@ -324,8 +318,8 @@ tail -f "$SERIAL_LOG" &
 TAIL_PID=$!
 trap 'kill $TAIL_PID 2>/dev/null || true' EXIT
 
-# Timeout at 35 minutes so a stuck install never hangs the runner for 6 hours
-timeout 2100 qemu-system-x86_64 \
+# Timeout at 20 minutes so a stuck install never hangs the runner
+timeout 1200 qemu-system-x86_64 \
   -enable-kvm \
   -machine q35,accel=kvm \
   -cpu host,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time \
