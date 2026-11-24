@@ -1,0 +1,122 @@
+param(
+    [ValidateSet('Release', 'Debug')]
+    [string]$BuildConfig = 'Release',
+    [string]$BuildNumber = '1',
+    [string]$OutputDir = 'ci-artifacts'
+)
+
+$ErrorActionPreference = 'Stop'
+$repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+Set-Location $repoRoot
+
+. .\scripts\build_helper.ps1
+Add-VisualStudio-Path
+$buildCmd = (Get-Command msbuild.exe -CommandType Application | Select-Object -First 1).Source
+Write-Host "Using MSBuild: $buildCmd"
+
+# 1. Import public Dokan test-signing certificate (without running bcdedit, which fails under Secure Boot)
+Write-Host "Importing Dokan test-signing certificates..."
+Import-Certificate -FilePath .\cert\DokanCA.cer -CertStoreLocation 'Cert:\LocalMachine\Root' | Out-Null
+Import-Certificate -FilePath .\cert\DokanCA.cer -CertStoreLocation 'Cert:\LocalMachine\TrustedPublisher' | Out-Null
+Import-PfxCertificate -FilePath .\cert\DokanSign.pfx -CertStoreLocation 'Cert:\CurrentUser\My' | Out-Null
+
+# 2. Ensure WDK NuGet packages are restored
+if (!(Test-Path -Path '.\packages\Microsoft.Windows.WDK.x64.*')) {
+    Write-Host "Restoring WDK NuGet packages..."
+    Exec-External { & nuget restore .\sys\packages.config -PackagesDirectory .\packages }
+}
+
+# 3. Compute version matching AppVeyor convention
+$xmlversion = [xml](Get-Content "$repoRoot\dokan_wix\version.xml")
+$baseVersion = ($xmlversion.Include.define | Where-Object { $_.StartsWith('BaseVersion=') }).Split('=')[1] -replace '"', ''
+$buildVerDef = ($xmlversion.Include.define | Where-Object { $_.StartsWith('BuildVersion=') }).Split('=')[1] -replace '"', ''
+$paddedBuild = $BuildNumber.Trim()
+if ($paddedBuild.Length -lt $buildVerDef.Length) {
+    $mmVersion = $buildVerDef.Substring(0, $buildVerDef.Length - $paddedBuild.Length) + $paddedBuild
+} else {
+    $mmVersion = $paddedBuild
+}
+$installerVersion = "$baseVersion.$mmVersion"
+Write-Host "Installer version: $installerVersion"
+
+(Get-Content "$repoRoot\CHANGELOG.md") -replace '[0-9]{1,2}\.[0-9]{1,2}\.[0-9]{1,2}\.[0-9]{1,4}', $installerVersion | Set-Content "$repoRoot\CHANGELOG.md"
+
+# 4. Resolve signtool.exe (prefer Windows Kits, fallback to WDK NuGet)
+$signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\10.0.*\x64\signtool.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
+if (!$signtool) {
+    $signtool = Get-ChildItem "$repoRoot\packages\Microsoft.Windows.SDK.CPP.x64.*\c\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
+}
+if (!$signtool) {
+    throw "signtool.exe not found"
+}
+Write-Host "Using signtool: $($signtool.FullName)"
+$env:Path += ";$($signtool.DirectoryName)"
+$env:CERTISSUER = 'DokanCA'
+$env:ADDITIONALCERT = "$repoRoot\cert\DokanCA.cer"
+$env:SIGNTOOL = $signtool.FullName
+
+# 5. Update assembly versions
+Push-Location "$repoRoot\dokan_wix"
+try {
+    Exec-External { & $buildCmd 'SetAssemblyVersion.sln' '/m' '/p:Configuration=Release' '/p:Platform=Any CPU' }
+    Exec-External { & .\SetAssemblyVersion\bin\Release\SetAssemblyVersion.exe ..\CHANGELOG.md version.xml ..\ }
+} finally {
+    Pop-Location
+}
+
+# 6. Build Dokan (Win32, x64, ARM64 + MSYS2 if available; Cygwin optional)
+$buildParts = @('win')
+if (Test-Path -LiteralPath 'C:\cygwin64\bin\bash.exe') {
+    $buildParts += 'cygwin'
+}
+if (Test-Path -LiteralPath 'C:\msys64\ucrt64\bin\gcc.exe' -and (Test-Path -LiteralPath 'C:\msys64\mingw32\bin\gcc.exe')) {
+    $buildParts += 'msys2'
+}
+Write-Host "Building Dokan parts: $($buildParts -join ', ')"
+Exec-External { & .\scripts\build.ps1 -BuildPart $buildParts -Configurations $BuildConfig }
+
+# 7. Sign binaries with public Dokan test cert
+Exec-External { & .\cert\dokan-sign.ps1 }
+
+# 8. Build WiX v4 installer
+Push-Location "$repoRoot\dokan_wix"
+try {
+    Get-ChildItem .\* -Include @('*.wixproj', '*.vcxproj') -Recurse | ForEach-Object {
+        Exec-External { & nuget restore $_.FullName -SolutionDirectory . }
+    }
+    $hasCygwin = ($buildParts -contains 'cygwin')
+    $hasMsys2 = ($buildParts -contains 'msys2')
+    $vXml = Get-Content version.xml
+    $vXml = $vXml -replace 'BuildCygwin="(true|false)"', "BuildCygwin=`"$($hasCygwin.ToString().ToLowerInvariant())`""
+    $vXml = $vXml -replace 'BuildMsys2="(true|false)"', "BuildMsys2=`"$($hasMsys2.ToString().ToLowerInvariant())`""
+    $vXml = $vXml -replace 'Compressed="no"', 'Compressed="yes"'
+    Set-Content version.xml $vXml
+
+    Exec-External { & $buildCmd 'Dokan_WiX.sln' '/m' "/p:Configuration=$BuildConfig" '/p:Platform=Mixed Platforms' }
+} finally {
+    Pop-Location
+}
+
+# 9. Pre-build fsx.exe (Liryna/fstools) so test VMs do not need Visual Studio
+$fstoolsDir = Join-Path $repoRoot 'ci-fstools'
+if (!(Test-Path $fstoolsDir)) {
+    Exec-External { & git clone -q https://github.com/Liryna/fstools.git $fstoolsDir }
+}
+Push-Location $fstoolsDir
+try {
+    Exec-External { & git reset --hard 9e378a7745a7dcb6fbfc1f649975e7a47c8f952e }
+    Exec-External { & $buildCmd '.\winfstest.sln' '/m' '/p:Configuration=Release' '/p:Platform=x64' }
+} finally {
+    Pop-Location
+}
+
+# 10. Stage artifacts
+$outAbs = Join-Path $repoRoot $OutputDir
+New-Item -ItemType Directory -Force -Path $outAbs | Out-Null
+Copy-Item -LiteralPath "$repoRoot\dokan_wix\Bootstrapper\bin\x86\$BuildConfig\DokanSetup.exe" -Destination "$outAbs\DokanSetup.exe" -Force
+Copy-Item -LiteralPath "$fstoolsDir\src\fsx\fsx.exe" -Destination "$outAbs\fsx.exe" -Force
+Copy-Item -LiteralPath "$repoRoot\x64\$BuildConfig\Driver\dokan3.pdb" -Destination "$outAbs\dokan3.pdb" -Force
+Copy-Item -LiteralPath "$repoRoot\cert\DokanCA.cer" -Destination "$outAbs\DokanCA.cer" -Force
+
+Write-Host "Staged build artifacts in ${outAbs}:"
+Get-ChildItem -LiteralPath $outAbs | Format-Table Name, Length
