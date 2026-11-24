@@ -66,21 +66,26 @@ SCP_OPTS=(
 
 wait_for_ssh() {
   local max_wait="${1:-180}"
-  local start
+  local start attempt=0 last_err=""
   start=$(date +%s)
   while true; do
+    attempt=$((attempt + 1))
     if ! kill -0 "$QEMU_PID" 2>/dev/null; then
       echo "ERROR: QEMU exited unexpectedly while waiting for SSH" >&2
       return 1
     fi
-    if ssh "${SSH_OPTS[@]}" Administrator@127.0.0.1 'echo SSH_READY' >/dev/null 2>&1; then
+    if last_err=$(ssh "${SSH_OPTS[@]}" Administrator@127.0.0.1 'echo SSH_READY' 2>&1); then
       return 0
     fi
+    if (( attempt % 10 == 1 )); then
+      echo "[wait_for_ssh +$(( $(date +%s) - start ))s] $(echo "$last_err" | tr '\n' ' ' | cut -c1-200)"
+    fi
     if (( $(date +%s) - start >= max_wait )); then
-      echo "ERROR: Timed out after ${max_wait}s waiting for guest SSH" >&2
+      echo "ERROR: Timed out after ${max_wait}s waiting for guest SSH. Verbose SSH probe:" >&2
+      ssh -v "${SSH_OPTS[@]}" Administrator@127.0.0.1 'echo SSH_READY' 2>&1 | tail -n 50 >&2 || true
       return 1
     fi
-    sleep 2
+    sleep 3
   done
 }
 
