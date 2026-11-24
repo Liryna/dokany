@@ -69,7 +69,7 @@ $buildParts = @('win')
 if (Test-Path -LiteralPath 'C:\cygwin64\bin\bash.exe') {
     $buildParts += 'cygwin'
 }
-if (Test-Path -LiteralPath 'C:\msys64\ucrt64\bin\gcc.exe' -and (Test-Path -LiteralPath 'C:\msys64\mingw32\bin\gcc.exe')) {
+if ((Test-Path -LiteralPath 'C:\msys64\ucrt64\bin\gcc.exe') -and (Test-Path -LiteralPath 'C:\msys64\mingw32\bin\gcc.exe')) {
     $buildParts += 'msys2'
 }
 Write-Host "Building Dokan parts: $($buildParts -join ', ')"

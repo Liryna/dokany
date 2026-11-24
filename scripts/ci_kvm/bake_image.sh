@@ -217,10 +217,12 @@ try {
 
     # 3. Enable TESTSIGNING and pre-arm Driver Verifier for dokan3.sys
     Log "Enabling TESTSIGNING and Driver Verifier for dokan3.sys..."
-    & bcdedit.exe /set testsigning on
+    & bcdedit.exe /set testsigning on | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "bcdedit testsigning failed: $LASTEXITCODE" }
-    & verifier.exe /standard /driver dokan3.sys
-    if ($LASTEXITCODE -ne 0) { throw "verifier config failed: $LASTEXITCODE" }
+    $vOut = (& verifier.exe /standard /driver dokan3.sys 2>&1 | Out-String).Trim()
+    # verifier.exe exit code 2 = EXIT_CODE_REBOOT_REQUIRED (success; changes take effect on next boot)
+    Log "verifier exit=$LASTEXITCODE: $vOut"
+    if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 2) { throw "verifier config failed: $LASTEXITCODE" }
 
     # 4. Configure Kernel Memory Dump (CrashDumpEnabled=2 -> C:\Windows\MEMORY.DMP) + AutoReboot
     Log "Configuring Kernel Memory Dump (MEMORY.DMP)..."
