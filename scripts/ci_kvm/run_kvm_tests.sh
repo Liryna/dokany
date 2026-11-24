@@ -28,7 +28,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "=== [$(date -u +%T)] Booting network-isolated KVM guest (restrict=on) ==="
+echo "=== [$(date -u +%T)] Booting KVM guest ==="
 T_BOOT0=$(date +%s)
 qemu-system-x86_64 \
   -enable-kvm \
@@ -37,11 +37,13 @@ qemu-system-x86_64 \
   -smp 4 \
   -m 6G \
   -display none \
+  -vga std \
+  -monitor "unix:${WORK_DIR}/mon.sock,server,nowait" \
   -serial "file:${SERIAL_LOG}" \
   -device ahci,id=ahci \
   -drive "file=${OVERLAY_IMG},format=qcow2,if=none,id=hd0,cache=writeback" \
   -device ide-hd,drive=hd0,bus=ahci.0 \
-  -netdev user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:2222-:22 \
+  -netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 \
   -device e1000e,netdev=net0 &
 QEMU_PID=$!
 
@@ -49,7 +51,7 @@ SSH_OPTS=(
   -i "$SSH_KEY"
   -o StrictHostKeyChecking=no
   -o UserKnownHostsFile=/dev/null
-  -o ConnectTimeout=5
+  -o ConnectTimeout=15
   -o BatchMode=yes
   -o ServerAliveInterval=15
   -o ServerAliveCountMax=4
@@ -83,6 +85,8 @@ wait_for_ssh() {
     if (( $(date +%s) - start >= max_wait )); then
       echo "ERROR: Timed out after ${max_wait}s waiting for guest SSH. Verbose SSH probe:" >&2
       ssh -v "${SSH_OPTS[@]}" Administrator@127.0.0.1 'echo SSH_READY' 2>&1 | tail -n 50 >&2 || true
+      echo "Capturing QEMU screendump to $RESULTS_DIR/boot-screen.ppm..." >&2
+      printf 'screendump %s/boot-screen.ppm\ninfo status\ninfo network\n' "$RESULTS_DIR" | socat - "UNIX-CONNECT:${WORK_DIR}/mon.sock" 2>&1 || true
       return 1
     fi
     sleep 3
