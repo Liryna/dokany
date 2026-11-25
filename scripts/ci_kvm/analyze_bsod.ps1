@@ -77,8 +77,20 @@ foreach ($archive in $dumps) {
         Write-Host "Extracted MEMORY.DMP: $([Math]::Round($dmpFile.Length / 1MB, 1)) MB"
 
         $analysisTxt = Join-Path $OutputDir "bsod-analysis-${label}.txt"
-        $kdCommands = '.reload /f dokan3.sys; !analyze -v; echo === STACK ===; kP 30; echo === DOKAN3 MODULE ===; lmvm dokan3; echo === DRIVER VERIFIER ===; !verifier 0xf; q'
-        $rawOut = @(& $debuggerExe -z $dmpFile.FullName -y $symPath -c $kdCommands 2>&1)
+        $kdScriptPath = Join-Path $extractDir 'kd_commands.txt'
+        $kdScriptLines = @(
+            '.reload /f dokan3.sys'
+            '!analyze -v'
+            '.echo === STACK ==='
+            'kP 30'
+            '.echo === DOKAN3 MODULE ==='
+            'lmvm dokan3'
+            '.echo === DRIVER VERIFIER ==='
+            '!verifier 0x1'
+            'q'
+        )
+        [System.IO.File]::WriteAllText($kdScriptPath, ($kdScriptLines -join "`r`n") + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
+        $rawOut = @(& $debuggerExe -z $dmpFile.FullName -y $symPath -cf $kdScriptPath 2>&1)
         $kdRc = $LASTEXITCODE
         $fullText = ($rawOut -join "`n")
         [System.IO.File]::WriteAllText($analysisTxt, $fullText, (New-Object System.Text.UTF8Encoding($false)))

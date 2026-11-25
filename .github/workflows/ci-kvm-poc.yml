@@ -232,6 +232,7 @@ jobs:
     needs: [build, kvm-test, kvm-bsod-selftest]
     if: always() && (needs.kvm-test.result == 'failure' || needs.kvm-bsod-selftest.result == 'success' || inputs.simulate_bsod == true)
     runs-on: windows-2022
+    timeout-minutes: 10
     steps:
       - name: Checkout dokany
         uses: actions/checkout@v7
