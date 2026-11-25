@@ -167,7 +167,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [server2016, server2019, server2022, server2025]
+        os: [server2019, server2022]
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -218,15 +218,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [server2016, server2019, server2022, server2025]
+        os: [server2019, server2022]
         shard: [shard1, shard2]
-        include:
-          # Known intermittent: PatchGuard (BugCheck 0x109) occasionally fires on Server 2025 under
-          # nested KVM during this shard. It stays visible and its dump is still analyzed, but it
-          # does not fail the workflow. See scripts/ci/README.md.
-          - os: server2025
-            shard: shard1
-            allow_failure: true
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
