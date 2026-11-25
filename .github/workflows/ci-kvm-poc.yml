@@ -173,8 +173,9 @@ jobs:
           retention-days: 7
 
   kvm-bsod-selftest:
-    name: BSOD Capture Proof (server2022 / simulated BugCheck)
+    name: BSOD Capture Self-Test (${{ inputs.bsod_os || 'server2022' }})
     needs: [build, kvm-image]
+    if: inputs.simulate_bsod == true
     runs-on: ubuntu-latest
     steps:
       - name: Checkout dokany
@@ -184,17 +185,17 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/share/swift || true
 
-      - name: Restore cached server2022 qcow2
+      - name: Restore cached qcow2 for BSOD self-test
         id: cache-img
         uses: actions/cache@v6
         with:
-          path: ${{ runner.temp }}/kvm-images/server2022
-          key: kvm-win-server2022-v1-${{ hashFiles('scripts/ci_kvm/bake_image.sh', 'scripts/install_wlk_ifstest.ps1', 'cert/DokanCA.cer') }}
+          path: ${{ runner.temp }}/kvm-images/${{ inputs.bsod_os || 'server2022' }}
+          key: kvm-win-${{ inputs.bsod_os || 'server2022' }}-v1-${{ hashFiles('scripts/ci_kvm/bake_image.sh', 'scripts/install_wlk_ifstest.ps1', 'cert/DokanCA.cer') }}
 
       - name: Fail if image cache missing
         if: steps.cache-img.outputs.cache-hit != 'true'
         run: |
-          echo "::error::Expected cached KVM image for server2022"
+          echo "::error::Expected cached KVM image for ${{ inputs.bsod_os || 'server2022' }}"
           exit 1
 
       - name: Download Dokan build artifacts
@@ -212,7 +213,7 @@ jobs:
           sudo udevadm trigger --name-match=kvm
           chmod +x scripts/ci_kvm/run_kvm_tests.sh
           ./scripts/ci_kvm/run_kvm_tests.sh \
-            "${{ runner.temp }}/kvm-images/server2022" \
+            "${{ runner.temp }}/kvm-images/${{ inputs.bsod_os || 'server2022' }}" \
             "${{ runner.temp }}/dokan-artifacts" \
             "${{ runner.temp }}/kvm-results" \
             "shard1" \
@@ -222,7 +223,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: kvm-results-bsod-selftest-server2022
+          name: kvm-results-bsod-selftest-${{ inputs.bsod_os || 'server2022' }}
           path: ${{ runner.temp }}/kvm-results/
           if-no-files-found: error
           retention-days: 3
@@ -230,7 +231,7 @@ jobs:
   analyze-bsod:
     name: Analyze BSOD MEMORY.DMP (kd.exe !analyze -v)
     needs: [build, kvm-test, kvm-bsod-selftest]
-    if: always() && (needs.kvm-test.result == 'failure' || needs.kvm-bsod-selftest.result == 'success' || inputs.simulate_bsod == true)
+    if: always() && (needs.kvm-test.result == 'failure' || needs.kvm-bsod-selftest.result == 'success')
     runs-on: windows-2022
     timeout-minutes: 10
     steps:
@@ -254,11 +255,15 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          .\scripts\ci_kvm\analyze_bsod.ps1 `
-            -ResultsRoot "${{ runner.temp }}\all-kvm-results" `
-            -SymbolsDir "${{ runner.temp }}\dokan-artifacts" `
-            -OutputDir "${{ runner.temp }}\bsod-reports" `
-            -RequireDump
+          $analyzeArgs = @{
+            ResultsRoot = "${{ runner.temp }}\all-kvm-results"
+            SymbolsDir  = "${{ runner.temp }}\dokan-artifacts"
+            OutputDir   = "${{ runner.temp }}\bsod-reports"
+          }
+          if ('${{ inputs.simulate_bsod }}' -eq 'true') {
+            $analyzeArgs['RequireDump'] = $true
+          }
+          .\scripts\ci_kvm\analyze_bsod.ps1 @analyzeArgs
 
       - name: Upload decoded BSOD analysis reports
         if: always()
