@@ -164,7 +164,21 @@ fetch_build_artifacts() {
     sleep 10
   done
   mkdir -p "$ARTIFACTS_DIR"
-  gh api "repos/$repo/actions/artifacts/$artifact_id/zip" > "$WORK_DIR/build-artifacts.zip"
+  # The artifact can be listed a few seconds before its zip is downloadable (finalization race -> HTTP 404).
+  local attempt downloaded="false"
+  for attempt in $(seq 1 18); do
+    if gh api "repos/$repo/actions/artifacts/$artifact_id/zip" > "$WORK_DIR/build-artifacts.zip" 2> "$WORK_DIR/artifact-dl.err" \
+        && unzip -tq "$WORK_DIR/build-artifacts.zip" >/dev/null 2>&1; then
+      downloaded="true"
+      break
+    fi
+    echo "Artifact $artifact_id not downloadable yet (attempt $attempt/18): $(head -c 200 "$WORK_DIR/artifact-dl.err" | tr '\n' ' ')"
+    sleep 10
+  done
+  if [[ "$downloaded" != "true" ]]; then
+    echo "ERROR: Could not download artifact $artifact_id after 18 attempts" >&2
+    return 1
+  fi
   unzip -o -q "$WORK_DIR/build-artifacts.zip" -d "$ARTIFACTS_DIR"
   rm -f "$WORK_DIR/build-artifacts.zip"
   if [[ ! -f "$ARTIFACTS_DIR/DokanSetup.exe" ]]; then
