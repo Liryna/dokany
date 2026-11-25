@@ -12,7 +12,7 @@ assignees: ''
   - [ ] My issue is valid with mirror default sample and not specific to my user-mode driver implementation
   - [ ] I can always reproduce the issue with the provided description below.
   - [ ] I have updated Dokany to the [latest version](https://github.com/dokan-dev/dokany/releases) and have reboot my computer after.
-  - [ ] I tested one of the last [snapshot](https://github.com/dokan-dev/dokany/wiki/Build#user-snapshot) from appveyor CI
+  - [ ] I tested the latest [snapshot](https://github.com/dokan-dev/dokany/actions/workflows/build-and-test.yml?query=branch%3Amaster) (`dokan-<version>` artifact of the latest `master` build)
 
 **Describe the bug**
 A clear and concise description of what the bug is.

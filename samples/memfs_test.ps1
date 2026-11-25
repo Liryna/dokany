@@ -95,7 +95,6 @@ if (Test-Path $vswhere) {
 }
 
 $env:CI_BUILD_ARG = ""
-if ($env:APPVEYOR) { $env:CI_BUILD_ARG="/l:C:\Program Files\AppVeyor\BuildAgent\Appveyor.MSBuildLogger.dll" }
  
 Write-Host Build test tools -ForegroundColor Green
 if (!(Test-Path .\fstools\src\fsx\fsx.exe))
