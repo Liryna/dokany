@@ -229,6 +229,8 @@ try {
     Set-ItemProperty -Path $cc -Name 'DumpFile' -Type ExpandString -Value '%SystemRoot%\MEMORY.DMP'
     Set-ItemProperty -Path $cc -Name 'Overwrite' -Type DWord -Value 1
     Set-ItemProperty -Path $cc -Name 'AutoReboot' -Type DWord -Value 1
+    # Let the CI host turn guest hangs into a kernel dump via QEMU 'nmi' (BugCheck 0x80 NMI_HARDWARE_FAILURE)
+    Set-ItemProperty -Path $cc -Name 'NMICrashDump' -Type DWord -Value 1
     # Ensure pagefile is large enough on C: for kernel memory dump, and zero it on bake shutdown so qemu-img drops it
     $mmKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'
     Set-ItemProperty -Path $mmKey -Name 'PagingFiles' -Type MultiString -Value @('C:\pagefile.sys 2048 4096')
@@ -412,16 +414,16 @@ echo "=== [$(date -u +%T)] Removing Windows ISO to free space before compression
 rm -f "$WORK_DIR/windows.iso" "$WORK_DIR/seed.iso"
 df -h / "$WORK_DIR"
 
-echo "=== [$(date -u +%T)] Sparsifying qcow2 (dropping zeroed free space & pagefile) + zstd --long=27 compression ==="
+echo "=== [$(date -u +%T)] Compacting qcow2 (drops zeroed free space + pagefile clusters) ==="
+# No extra compression layer here: actions/cache already compresses with 'zstdmt --long=30'
+# on save and decompresses inline on restore, so a second zstd pass only costs time.
 T_COMP0=$(date +%s)
-qemu-img convert -O qcow2 "$WORK_DIR/base-raw.qcow2" "$WORK_DIR/base-sparse.qcow2"
-rm -f "$WORK_DIR/base-raw.qcow2"
-echo "Sparse uncompressed qcow2 size: $(du -h "$WORK_DIR/base-sparse.qcow2" | awk '{print $1}')"
 rm -f "$OUT_DIR/base.qcow2" "$OUT_DIR/base.qcow2.zst"
-zstd -11 --long=27 -T0 --rm "$WORK_DIR/base-sparse.qcow2" -o "$OUT_DIR/base.qcow2.zst"
+qemu-img convert -O qcow2 "$WORK_DIR/base-raw.qcow2" "$OUT_DIR/base.qcow2"
+rm -f "$WORK_DIR/base-raw.qcow2"
 T_COMP1=$(date +%s)
 
 echo "=== [$(date -u +%T)] Image bake complete! ==="
 echo "Raw install+provision+DISM time: $((T_END - T_BOOT))s"
-echo "Sparsify + zstd --long=27 time:  $((T_COMP1 - T_COMP0))s"
-ls -lh "$OUT_DIR/base.qcow2.zst"
+echo "qcow2 compaction time:           $((T_COMP1 - T_COMP0))s"
+ls -lh "$OUT_DIR/base.qcow2"

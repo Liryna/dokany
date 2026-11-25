@@ -1,11 +1,32 @@
 #!/usr/bin/env bash
+# Boots a cached, test-signed Windows Server Core image under KVM (network-isolated),
+# installs Dokan under Driver Verifier, runs the FS test shard, and harvests crash dumps.
+#
+# The VM boots *before* the Windows build finishes: if <artifacts_dir> has no DokanSetup.exe
+# and DOKAN_ARTIFACT_RUN_ID is set, the script polls the GitHub API for the
+# 'dokan-build-artifacts' artifact of that run once the guest is up.
+#
+# Hangs: if the guest test times out or SSH dies while QEMU is still running, an NMI is
+# injected (guest image has CrashControl\NMICrashDump=1) so Windows writes a kernel
+# MEMORY.DMP of the hung state, which is then harvested like any other BugCheck.
 set -euo pipefail
 
-IMAGE_DIR="${1:?usage: run_kvm_tests.sh <image_dir> <artifacts_dir> <results_dir> [shard] [simulate_bsod]}"
-ARTIFACTS_DIR="${2:?usage: run_kvm_tests.sh <image_dir> <artifacts_dir> <results_dir> [shard] [simulate_bsod]}"
-RESULTS_DIR="${3:?usage: run_kvm_tests.sh <image_dir> <artifacts_dir> <results_dir> [shard] [simulate_bsod]}"
+usage='usage: run_kvm_tests.sh <image_dir> <artifacts_dir> <results_dir> [shard] [simulate: false|bugcheck|nmi]'
+IMAGE_DIR="${1:?$usage}"
+ARTIFACTS_DIR="${2:?$usage}"
+RESULTS_DIR="${3:?$usage}"
 SHARD="${4:-all}"
-SIMULATE_BSOD="${5:-false}"
+SIMULATE="${5:-false}"
+case "$SIMULATE" in
+  true|bugcheck) SIMULATE="bugcheck" ;;
+  false|nmi) ;;
+  *) echo "ERROR: invalid simulate mode '$SIMULATE'" >&2; exit 2 ;;
+esac
+
+GUEST_TEST_TIMEOUT="${GUEST_TEST_TIMEOUT:-2700}"
+if [[ "$SIMULATE" == "nmi" ]]; then
+  GUEST_TEST_TIMEOUT=120
+fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK_DIR="${RUNNER_TEMP:-/tmp}/kvm-test-run"
@@ -15,19 +36,17 @@ SSH_KEY="$IMAGE_DIR/id_ed25519"
 OVERLAY_IMG="$WORK_DIR/overlay.qcow2"
 SERIAL_LOG="$RESULTS_DIR/serial.log"
 
-if [[ -f "$IMAGE_DIR/base.qcow2.zst" ]]; then
-  BASE_IMG="$WORK_DIR/base.qcow2"
-  echo "=== [$(date -u +%T)] Decompressing cached base.qcow2.zst ==="
-  T_DEC0=$(date +%s)
-  zstd -d --long=27 -T0 -f "$IMAGE_DIR/base.qcow2.zst" -o "$BASE_IMG"
-  T_DEC1=$(date +%s)
-  echo "Decompressed $(du -h "$IMAGE_DIR/base.qcow2.zst" | awk '{print $1}') -> $(du -h "$BASE_IMG" | awk '{print $1}') in $((T_DEC1 - T_DEC0))s"
-elif [[ -f "$IMAGE_DIR/base.qcow2" ]]; then
+if [[ -f "$IMAGE_DIR/base.qcow2" ]]; then
   BASE_IMG="$IMAGE_DIR/base.qcow2"
+elif [[ -f "$IMAGE_DIR/base.qcow2.zst" ]]; then
+  BASE_IMG="$WORK_DIR/base.qcow2"
+  echo "=== [$(date -u +%T)] Decompressing legacy base.qcow2.zst ==="
+  zstd -d --long=27 -T0 -f "$IMAGE_DIR/base.qcow2.zst" -o "$BASE_IMG"
 else
-  echo "ERROR: Neither $IMAGE_DIR/base.qcow2.zst nor $IMAGE_DIR/base.qcow2 found!" >&2
+  echo "ERROR: No base.qcow2 (or legacy base.qcow2.zst) in $IMAGE_DIR" >&2
   exit 1
 fi
+echo "Base image: $BASE_IMG ($(du -h "$BASE_IMG" | awk '{print $1}'))"
 
 chmod 600 "$SSH_KEY"
 
@@ -63,9 +82,9 @@ start_qemu() {
   QEMU_PID=$!
 }
 
-echo "=== [$(date -u +%T)] Booting network-isolated KVM guest (restrict=on, shard=${SHARD}, simulate_bsod=${SIMULATE_BSOD}) ==="
-T_BOOT0=$(date +%s)
-start_qemu
+qemu_monitor() {
+  printf '%s\n' "$@" | socat - "UNIX-CONNECT:${WORK_DIR}/mon.sock" 2>&1 || true
+}
 
 SSH_OPTS=(
   -i "$SSH_KEY"
@@ -103,25 +122,69 @@ wait_for_ssh() {
       echo "[wait_for_ssh +$(( $(date +%s) - start ))s] $(echo "$last_err" | tr '\n' ' ' | cut -c1-200)"
     fi
     if (( $(date +%s) - start >= max_wait )); then
-      echo "ERROR: Timed out after ${max_wait}s waiting for guest SSH. Verbose SSH probe:" >&2
-      ssh -v "${SSH_OPTS[@]}" Administrator@127.0.0.1 'echo SSH_READY' 2>&1 | tail -n 50 >&2 || true
+      echo "ERROR: Timed out after ${max_wait}s waiting for guest SSH." >&2
       echo "Capturing QEMU screendump to $RESULTS_DIR/boot-screen.ppm..." >&2
-      printf 'screendump %s/boot-screen.ppm\ninfo status\ninfo network\n' "$RESULTS_DIR" | socat - "UNIX-CONNECT:${WORK_DIR}/mon.sock" 2>&1 || true
+      qemu_monitor "screendump $RESULTS_DIR/boot-screen.ppm" "info status" >/dev/null
       return 1
     fi
     sleep 3
   done
 }
 
-# Retry initial boot once if Windows stalls on early boot logo under nested KVM
+fetch_build_artifacts() {
+  if [[ -f "$ARTIFACTS_DIR/DokanSetup.exe" ]]; then
+    return 0
+  fi
+  local run_id="${DOKAN_ARTIFACT_RUN_ID:?DokanSetup.exe missing and DOKAN_ARTIFACT_RUN_ID not set}"
+  local repo="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY not set}"
+  local name="${DOKAN_ARTIFACT_NAME:-dokan-build-artifacts}"
+  local deadline=$(( $(date +%s) + ${DOKAN_ARTIFACT_TIMEOUT:-2400} ))
+  local artifact_id="" build_state=""
+  echo "=== [$(date -u +%T)] Guest is up; waiting for '$name' from run $run_id ==="
+  while true; do
+    artifact_id=$(gh api "repos/$repo/actions/runs/$run_id/artifacts?name=$name" --jq '.artifacts[0].id // empty' 2>/dev/null || true)
+    if [[ -n "$artifact_id" ]]; then
+      break
+    fi
+    build_state=$(gh api "repos/$repo/actions/runs/$run_id/jobs?per_page=100" \
+      --jq '[.jobs[] | select(.name | startswith("Build & Test-Sign"))][0] | "\(.status):\(.conclusion)"' 2>/dev/null || echo "unknown:")
+    if [[ "$build_state" == completed:* && "$build_state" != "completed:success" ]]; then
+      echo "ERROR: Build job finished as '$build_state'; no artifacts to test." >&2
+      return 1
+    fi
+    if (( $(date +%s) > deadline )); then
+      echo "ERROR: Timed out waiting for build artifact '$name' (last build state: $build_state)" >&2
+      return 1
+    fi
+    sleep 10
+  done
+  mkdir -p "$ARTIFACTS_DIR"
+  gh api "repos/$repo/actions/artifacts/$artifact_id/zip" > "$WORK_DIR/build-artifacts.zip"
+  unzip -o -q "$WORK_DIR/build-artifacts.zip" -d "$ARTIFACTS_DIR"
+  rm -f "$WORK_DIR/build-artifacts.zip"
+  if [[ ! -f "$ARTIFACTS_DIR/DokanSetup.exe" ]]; then
+    echo "ERROR: Downloaded artifact $artifact_id does not contain DokanSetup.exe" >&2
+    return 1
+  fi
+}
+
+echo "=== [$(date -u +%T)] Booting network-isolated KVM guest (restrict=on, shard=${SHARD}, simulate=${SIMULATE}) ==="
+T_BOOT0=$(date +%s)
+start_qemu
+# Retry initial boot once if Windows stalls on the early boot logo under nested KVM
 if ! wait_for_ssh 90; then
-  echo "WARNING: Initial guest boot did not reach SSH within 90s; resetting fresh CoW overlay and retrying once..." >&2
+  echo "WARNING: Guest did not reach SSH within 90s; resetting fresh CoW overlay and retrying once..." >&2
   T_BOOT0=$(date +%s)
   start_qemu
   wait_for_ssh 150
 fi
 T_BOOT1=$(date +%s)
 echo "=== [$(date -u +%T)] Guest SSH ready in $((T_BOOT1 - T_BOOT0))s ==="
+
+T_ART0=$(date +%s)
+fetch_build_artifacts
+T_ART1=$(date +%s)
+echo "=== [$(date -u +%T)] Build artifacts ready (waited $((T_ART1 - T_ART0))s after guest boot) ==="
 
 echo "=== [$(date -u +%T)] Copying build artifacts and test scripts into guest ==="
 ssh "${SSH_OPTS[@]}" Administrator@127.0.0.1 'New-Item -ItemType Directory -Force -Path C:\ci | Out-Null'
@@ -141,31 +204,53 @@ if [[ -f "$ARTIFACTS_DIR/dokan_fstest.exe" ]]; then
 fi
 
 GUEST_CMD="& C:\ci\guest_test.ps1 -Shard '${SHARD}'"
-if [[ "$SIMULATE_BSOD" == "true" ]]; then
-  GUEST_CMD="${GUEST_CMD} -SimulateBsod"
-fi
+case "$SIMULATE" in
+  bugcheck) GUEST_CMD="${GUEST_CMD} -SimulateBsod" ;;
+  nmi) GUEST_CMD="${GUEST_CMD} -SimulateHang" ;;
+esac
 
-echo "=== [$(date -u +%T)] Executing Dokan install + Driver Verifier + FS tests (${GUEST_CMD}) ==="
+echo "=== [$(date -u +%T)] Executing Dokan install + Driver Verifier + FS tests (${GUEST_CMD}, timeout ${GUEST_TEST_TIMEOUT}s) ==="
 T_TEST0=$(date +%s)
 set +e
-ssh "${SSH_OPTS[@]}" Administrator@127.0.0.1 "$GUEST_CMD"
+timeout --signal=TERM "$GUEST_TEST_TIMEOUT" ssh "${SSH_OPTS[@]}" Administrator@127.0.0.1 "$GUEST_CMD"
 TEST_RC=$?
 set -e
 T_TEST1=$(date +%s)
 echo "=== [$(date -u +%T)] Guest test script exited with code $TEST_RC in $((T_TEST1 - T_TEST0))s ==="
 
-# Harvest logs, fstest scorecards, and check for BSOD (even if SSH dropped mid-test due to a bugcheck!)
+NMI_INJECTED="false"
+inject_nmi() {
+  echo "=== [$(date -u +%T)] Guest appears hung: capturing screen and injecting NMI (NMICrashDump=1 -> BugCheck 0x80) ==="
+  qemu_monitor "screendump $RESULTS_DIR/hang-screen.ppm" >/dev/null
+  qemu_monitor "nmi" >/dev/null
+  NMI_INJECTED="true"
+}
+
 BSOD_HARVESTED="false"
 harvest_bsod_if_any() {
-  echo "=== [$(date -u +%T)] Checking for BSOD / MEMORY.DMP and harvesting logs ==="
-  # If SSH dropped (e.g. rc=255 during BSOD), give Windows a few seconds to begin writing crash dump + rebooting
-  if [[ $TEST_RC -ne 0 ]]; then
+  echo "=== [$(date -u +%T)] Checking for BSOD / hang and harvesting logs ==="
+  local guest_back="false"
+  if [[ $TEST_RC -eq 124 ]]; then
+    echo "Guest test exceeded ${GUEST_TEST_TIMEOUT}s."
+    inject_nmi
+    wait_for_ssh 480 && guest_back="true"
+  elif [[ $TEST_RC -ne 0 ]]; then
+    # SSH may have dropped because of a real BugCheck: give Windows time to write the dump and reboot
     sleep 8
+    if wait_for_ssh 180; then
+      guest_back="true"
+    elif kill -0 "$QEMU_PID" 2>/dev/null; then
+      inject_nmi
+      wait_for_ssh 480 && guest_back="true"
+    fi
+  else
+    wait_for_ssh 60 && guest_back="true"
   fi
-  if wait_for_ssh 180; then
+
+  if [[ "$guest_back" == "true" ]]; then
     local bsod_check_rc=0
     ssh "${SSH_OPTS[@]}" Administrator@127.0.0.1 '
-      # Wait up to 45s for SaveDump/WER to finish copying pagefile to C:\Windows\MEMORY.DMP after reboot
+      # Wait up to ~45s for the crash dump to be finalized as C:\Windows\MEMORY.DMP after reboot
       for ($w = 0; $w -lt 15; $w++) {
         if (Test-Path "C:\Windows\MEMORY.DMP") {
           $len1 = (Get-Item "C:\Windows\MEMORY.DMP").Length
@@ -192,68 +277,78 @@ harvest_bsod_if_any() {
     scp "${SCP_OPTS[@]}" -r "Administrator@127.0.0.1:C:/ci/fstest-results" "$RESULTS_DIR/" 2>/dev/null || true
     if [[ $bsod_check_rc -eq 42 ]]; then
       echo "Downloading C:\Windows\MEMORY.DMP from guest..."
-      T_DMP0=$(date +%s)
+      local t0 t1
+      t0=$(date +%s)
       scp "${SCP_OPTS[@]}" "Administrator@127.0.0.1:C:/Windows/MEMORY.DMP" "$WORK_DIR/MEMORY.DMP"
       ls -lh "$WORK_DIR/MEMORY.DMP"
       7z a -t7z -mx=3 "$RESULTS_DIR/MEMORY.DMP.7z" "$WORK_DIR/MEMORY.DMP" >/dev/null
       rm -f "$WORK_DIR/MEMORY.DMP"
-      T_DMP1=$(date +%s)
-      echo "Saved compressed crash dump to $RESULTS_DIR/MEMORY.DMP.7z ($(du -h "$RESULTS_DIR/MEMORY.DMP.7z" | awk '{print $1}')) in $((T_DMP1 - T_DMP0))s"
+      t1=$(date +%s)
+      echo "Saved compressed crash dump to $RESULTS_DIR/MEMORY.DMP.7z ($(du -h "$RESULTS_DIR/MEMORY.DMP.7z" | awk '{print $1}')) in $((t1 - t0))s"
       BSOD_HARVESTED="true"
-      echo "BSOD_DETECTED" > "$RESULTS_DIR/BSOD_DETECTED"
+      if [[ "$NMI_INJECTED" == "true" ]]; then
+        echo "HANG_NMI_DUMP" > "$RESULTS_DIR/HANG_DETECTED"
+      else
+        echo "BSOD_DETECTED" > "$RESULTS_DIR/BSOD_DETECTED"
+      fi
       ssh "${SSH_OPTS[@]}" Administrator@127.0.0.1 'shutdown /s /t 0' 2>/dev/null || true
       wait "$QEMU_PID" 2>/dev/null || true
       return 1
     fi
     ssh "${SSH_OPTS[@]}" Administrator@127.0.0.1 'shutdown /s /t 0' 2>/dev/null || true
     wait "$QEMU_PID" 2>/dev/null || true
-    return 0
-  else
-    echo "Guest did not return over SSH (possible hang/boot-loop); attempting offline disk harvest..."
-    kill "$QEMU_PID" 2>/dev/null || true
-    wait "$QEMU_PID" 2>/dev/null || true
-    if command -v qemu-nbd >/dev/null 2>&1; then
-      sudo modprobe nbd max_part=8 || true
-      sudo qemu-nbd --read-only --connect=/dev/nbd0 "$OVERLAY_IMG" || true
-      sleep 2
-      mkdir -p "$WORK_DIR/mnt"
-      if sudo mount -o ro /dev/nbd0p2 "$WORK_DIR/mnt" 2>/dev/null; then
-        if [[ -f "$WORK_DIR/mnt/Windows/MEMORY.DMP" ]]; then
-          echo "Found offline C:\Windows\MEMORY.DMP!"
-          7z a -t7z -mx=3 "$RESULTS_DIR/MEMORY.DMP.7z" "$WORK_DIR/mnt/Windows/MEMORY.DMP" >/dev/null
-          BSOD_HARVESTED="true"
-          echo "BSOD_DETECTED" > "$RESULTS_DIR/BSOD_DETECTED"
-        fi
-        cp "$WORK_DIR/mnt/ci/"dokan_install*.log "$RESULTS_DIR/" 2>/dev/null || true
-        cp -r "$WORK_DIR/mnt/ci/fstest-results" "$RESULTS_DIR/" 2>/dev/null || true
-        sudo umount "$WORK_DIR/mnt" || true
-      fi
-      sudo qemu-nbd --disconnect /dev/nbd0 || true
+    if [[ "$NMI_INJECTED" == "true" ]]; then
+      echo "ERROR: NMI was injected but no MEMORY.DMP was produced." >&2
+      return 1
     fi
-    return 1
+    return 0
   fi
+
+  echo "Guest did not return over SSH; attempting offline disk harvest..."
+  kill "$QEMU_PID" 2>/dev/null || true
+  wait "$QEMU_PID" 2>/dev/null || true
+  if command -v qemu-nbd >/dev/null 2>&1; then
+    sudo modprobe nbd max_part=8 || true
+    sudo qemu-nbd --read-only --connect=/dev/nbd0 "$OVERLAY_IMG" || true
+    sleep 2
+    mkdir -p "$WORK_DIR/mnt"
+    if sudo mount -o ro /dev/nbd0p2 "$WORK_DIR/mnt" 2>/dev/null; then
+      if [[ -f "$WORK_DIR/mnt/Windows/MEMORY.DMP" ]]; then
+        echo "Found offline C:\Windows\MEMORY.DMP!"
+        7z a -t7z -mx=3 "$RESULTS_DIR/MEMORY.DMP.7z" "$WORK_DIR/mnt/Windows/MEMORY.DMP" >/dev/null
+        BSOD_HARVESTED="true"
+        echo "BSOD_DETECTED" > "$RESULTS_DIR/BSOD_DETECTED"
+      fi
+      cp "$WORK_DIR/mnt/ci/"dokan_install*.log "$RESULTS_DIR/" 2>/dev/null || true
+      cp -r "$WORK_DIR/mnt/ci/fstest-results" "$RESULTS_DIR/" 2>/dev/null || true
+      sudo umount "$WORK_DIR/mnt" || true
+    fi
+    sudo qemu-nbd --disconnect /dev/nbd0 || true
+  fi
+  return 1
 }
 
 BSOD_RC=0
 harvest_bsod_if_any || BSOD_RC=$?
 
 echo "=== Summary Timings ==="
-echo "VM boot to SSH:  $((T_BOOT1 - T_BOOT0))s"
-echo "Test duration:   $((T_TEST1 - T_TEST0))s"
-echo "BSOD harvested:  ${BSOD_HARVESTED}"
+echo "VM boot to SSH:          $((T_BOOT1 - T_BOOT0))s"
+echo "Wait for build artifact: $((T_ART1 - T_ART0))s"
+echo "Test duration:           $((T_TEST1 - T_TEST0))s"
+echo "NMI injected:            ${NMI_INJECTED}"
+echo "Crash dump harvested:    ${BSOD_HARVESTED}"
 
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
   echo "bsod_detected=${BSOD_HARVESTED}" >> "$GITHUB_OUTPUT"
 fi
 
-if [[ "$SIMULATE_BSOD" == "true" ]]; then
+if [[ "$SIMULATE" != "false" ]]; then
   if [[ "$BSOD_HARVESTED" == "true" ]]; then
-    echo "=== SIMULATED BSOD SELF-TEST: MEMORY.DMP.7z successfully harvested! ==="
+    echo "=== SIMULATED ${SIMULATE^^} SELF-TEST: MEMORY.DMP.7z successfully harvested ==="
     exit 0
-  else
-    echo "ERROR: SIMULATE_BSOD=true was set, but no MEMORY.DMP was harvested!" >&2
-    exit 1
   fi
+  echo "ERROR: simulate=${SIMULATE} but no MEMORY.DMP was harvested!" >&2
+  exit 1
 fi
 
 if [[ $TEST_RC -ne 0 ]] || [[ $BSOD_RC -ne 0 ]]; then

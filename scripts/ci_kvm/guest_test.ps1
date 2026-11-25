@@ -3,7 +3,8 @@ param(
     [string]$Shard = 'all',
     [ValidateSet('fail', 'warn')]
     [string]$XpassPolicy = 'fail',
-    [switch]$SimulateBsod
+    [switch]$SimulateBsod,
+    [switch]$SimulateHang
 )
 
 $ErrorActionPreference = 'Stop'
@@ -47,6 +48,13 @@ if ($LASTEXITCODE -ne 0) {
 }
 if ($vq -notmatch 'dokan3\.sys') {
     throw "Driver Verifier is NOT monitoring dokan3.sys!"
+}
+
+if ($SimulateHang) {
+    Write-Host "=== [SIMULATED HANG] Blocking forever so the host watchdog injects an NMI (dokan3.sys loaded under Driver Verifier) ===" -ForegroundColor Yellow
+    [Console]::Out.Flush()
+    Start-Sleep -Seconds 3600
+    throw "Simulated hang was not interrupted by the host watchdog!"
 }
 
 if ($SimulateBsod) {

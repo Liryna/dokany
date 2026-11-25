@@ -8,11 +8,18 @@ on:
   workflow_dispatch:
     inputs:
       simulate_bsod:
-        description: 'Trigger a controlled guest BugCheck to verify MEMORY.DMP + kd.exe capture'
+        description: 'Run the crash-capture self-test instead of the FS test matrix'
         type: boolean
         default: false
+      bsod_mode:
+        description: 'bugcheck = guest NtRaiseHardError BugCheck; nmi = simulated hang -> host NMI -> BugCheck 0x80'
+        type: choice
+        options:
+          - nmi
+          - bugcheck
+        default: nmi
       bsod_os:
-        description: 'OS image for simulated BSOD self-test'
+        description: 'OS image for the crash-capture self-test'
         type: choice
         options:
           - server2022
@@ -23,6 +30,7 @@ on:
 
 permissions:
   contents: read
+  actions: read # kvm-test polls this run's artifacts while the guest boots in parallel with the build
 
 concurrency:
   group: ci-kvm-poc-${{ github.ref }}
@@ -54,29 +62,54 @@ jobs:
           path: ${{ runner.temp }}/fstest-deps
           key: fstest-deps-${{ hashFiles('tests/fstest/deps.json') }}
 
+      - name: Compute weekly Cygwin cache key
+        id: cyg-week
+        shell: powershell
+        run: Add-Content -Path $env:GITHUB_OUTPUT -Value "week=$(Get-Date -UFormat '%Y-w%V')"
+
+      - name: Cache Cygwin package downloads (refreshed weekly)
+        id: cache-cygwin
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/cygwin-pkg-cache
+          key: cygwin-pkgs-v1-${{ steps.cyg-week.outputs.week }}
+          restore-keys: |
+            cygwin-pkgs-v1-
+
       - name: Install Cygwin & MSYS2 (UCRT64 + MINGW32) for dokan_fuse
         shell: powershell
+        env:
+          CYGWIN_CACHE_HIT: ${{ steps.cache-cygwin.outputs.cache-hit }}
         run: |
           $ErrorActionPreference = 'Stop'
           $cygCache = Join-Path $env:RUNNER_TEMP 'cygwin-pkg-cache'
           $cygSetup = Join-Path $env:RUNNER_TEMP 'setup-x86_64.exe'
           New-Item -ItemType Directory -Force -Path 'C:\cygwin64', $cygCache | Out-Null
-          Write-Host "Downloading and installing Cygwin build tools..."
           Invoke-WebRequest -UseBasicParsing -Uri 'https://cygwin.com/setup-x86_64.exe' -OutFile $cygSetup
-          $cygProc = Start-Process -FilePath $cygSetup -ArgumentList @(
-            '-gqnNdO', '-R', 'C:/cygwin64',
-            '-s', 'http://mirrors.kernel.org/sourceware/cygwin/',
-            '-l', $cygCache,
-            '-P', 'cmake', '-P', 'make', '-P', 'gcc-core', '-P', 'gcc-g++', '-P', 'pkg-config'
-          ) -Wait -PassThru
-          if ($cygProc.ExitCode -ne 0) {
-            throw "Cygwin setup-x86_64.exe failed with exit code $($cygProc.ExitCode)"
+          $cygPkgs = @('-P', 'cmake', '-P', 'make', '-P', 'gcc-core', '-P', 'gcc-g++', '-P', 'pkg-config')
+          $cygBase = @('-gqnNdO', '-R', 'C:/cygwin64', '-l', $cygCache) + $cygPkgs
+          $t0 = Get-Date
+          $installed = $false
+          if ($env:CYGWIN_CACHE_HIT -eq 'true') {
+            Write-Host "Installing Cygwin from this week's cached packages (local install, no mirror)..."
+            $p = Start-Process -FilePath $cygSetup -ArgumentList ($cygBase + @('-L')) -Wait -PassThru
+            $installed = ($p.ExitCode -eq 0)
+            if (-not $installed) { Write-Warning "Cygwin local install failed ($($p.ExitCode)); falling back to mirror." }
           }
-          Write-Host "Installing MSYS2 make + MINGW32 + UCRT64 GCC toolchains..."
+          if (-not $installed) {
+            Write-Host "Installing Cygwin from mirror (reusing any cached packages)..."
+            $p = Start-Process -FilePath $cygSetup -ArgumentList ($cygBase + @('-s', 'http://mirrors.kernel.org/sourceware/cygwin/')) -Wait -PassThru
+            if ($p.ExitCode -ne 0) {
+              throw "Cygwin setup-x86_64.exe failed with exit code $($p.ExitCode)"
+            }
+          }
+          Write-Host "Cygwin ready in $([int]((Get-Date) - $t0).TotalSeconds)s"
+          $t1 = Get-Date
           & C:\msys64\usr\bin\bash.exe --login -c "pacman -Sy --needed --noconfirm msys2-keyring && pacman -S --needed --noconfirm make mingw-w64-i686-gcc mingw-w64-ucrt-x86_64-gcc"
           if ($LASTEXITCODE -ne 0) {
             throw "MSYS2 pacman install failed with exit code $LASTEXITCODE"
           }
+          Write-Host "MSYS2 toolchains ready in $([int]((Get-Date) - $t1).TotalSeconds)s"
 
       - name: Build, test-sign, package WiX + release zip, and build test tools
         id: build-dokan
@@ -120,34 +153,44 @@ jobs:
       - name: Checkout dokany
         uses: actions/checkout@v7
 
-      - name: Reclaim runner disk space
+      - name: Check KVM image cache (lookup only, no download)
+        id: cache-img
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/kvm-images/${{ matrix.os }}
+          key: kvm-win-${{ matrix.os }}-v3-${{ hashFiles('scripts/ci_kvm/bake_image.sh', 'scripts/install_wlk_ifstest.ps1', 'cert/DokanCA.cer') }}
+          lookup-only: true
+
+      - name: Reclaim runner disk space (on cache miss)
+        if: steps.cache-img.outputs.cache-hit != 'true'
         run: |
-          df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/share/swift || true
           docker system prune -af --volumes 2>/dev/null || true
           df -h /
-
-      - name: Restore or save cached Windows Server Core qcow2
-        id: cache-img
-        uses: actions/cache@v6
-        with:
-          path: ${{ runner.temp }}/kvm-images/${{ matrix.os }}
-          key: kvm-win-${{ matrix.os }}-v2-${{ hashFiles('scripts/ci_kvm/bake_image.sh', 'scripts/install_wlk_ifstest.ps1', 'cert/DokanCA.cer') }}
 
       - name: Bake Windows Server Core qcow2 image (on cache miss)
         if: steps.cache-img.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-system-x86 qemu-utils genisoimage curl openssh-client zstd
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils genisoimage curl openssh-client
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
           chmod +x scripts/ci_kvm/bake_image.sh
           ./scripts/ci_kvm/bake_image.sh "${{ matrix.os }}" "${{ runner.temp }}/kvm-images/${{ matrix.os }}"
 
+      - name: Save baked image (actions/cache applies zstd --long=30)
+        if: steps.cache-img.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/kvm-images/${{ matrix.os }}
+          key: kvm-win-${{ matrix.os }}-v3-${{ hashFiles('scripts/ci_kvm/bake_image.sh', 'scripts/install_wlk_ifstest.ps1', 'cert/DokanCA.cer') }}
+
   kvm-test:
     name: Kernel + Driver Verifier (${{ matrix.os }} / ${{ matrix.shard }})
-    needs: [build, kvm-image]
+    # Deliberately NOT 'needs: build': the guest restores + boots while Windows builds,
+    # then run_kvm_tests.sh polls for this run's 'dokan-build-artifacts'.
+    needs: [kvm-image]
     if: inputs.simulate_bsod != true
     runs-on: ubuntu-latest
     strategy:
@@ -172,31 +215,26 @@ jobs:
 
       - name: Restore cached Windows Server Core qcow2
         id: cache-img
-        uses: actions/cache@v6
+        uses: actions/cache/restore@v6
         with:
           path: ${{ runner.temp }}/kvm-images/${{ matrix.os }}
-          key: kvm-win-${{ matrix.os }}-v2-${{ hashFiles('scripts/ci_kvm/bake_image.sh', 'scripts/install_wlk_ifstest.ps1', 'cert/DokanCA.cer') }}
+          key: kvm-win-${{ matrix.os }}-v3-${{ hashFiles('scripts/ci_kvm/bake_image.sh', 'scripts/install_wlk_ifstest.ps1', 'cert/DokanCA.cer') }}
+          fail-on-cache-miss: true
 
-      - name: Fail if image cache missing
-        if: steps.cache-img.outputs.cache-hit != 'true'
-        run: |
-          echo "::error::Expected cached KVM image for ${{ matrix.os }} from kvm-image job"
-          exit 1
-
-      - name: Download Dokan build artifacts
-        uses: actions/download-artifact@v7
-        with:
-          name: dokan-build-artifacts
-          path: ${{ runner.temp }}/dokan-artifacts
-
-      - name: Install QEMU/KVM and run Dokan kernel + Driver Verifier suite
-        id: run-kvm
+      - name: Install QEMU/KVM
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-system-x86 qemu-utils openssh-client p7zip-full ntfs-3g socat zstd
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils openssh-client p7zip-full ntfs-3g socat unzip
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+
+      - name: Boot guest, wait for build, run Dokan kernel + Driver Verifier suite
+        id: run-kvm
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DOKAN_ARTIFACT_RUN_ID: ${{ github.run_id }}
+        run: |
           chmod +x scripts/ci_kvm/run_kvm_tests.sh
           ./scripts/ci_kvm/run_kvm_tests.sh \
             "${{ runner.temp }}/kvm-images/${{ matrix.os }}" \
@@ -215,9 +253,10 @@ jobs:
           retention-days: 7
 
   kvm-bsod-selftest:
-    name: BSOD Capture Self-Test (${{ inputs.bsod_os || 'server2022' }})
-    needs: [build, kvm-image]
-    if: inputs.simulate_bsod == true
+    name: Crash Capture Self-Test (${{ inputs.bsod_os || 'server2022' }} / ${{ inputs.bsod_mode || 'nmi' }})
+    needs: [kvm-image]
+    # TEMP(PoC): also runs on pull_request to prove the NMI hang-dump path once; gate back to dispatch-only afterwards.
+    if: inputs.simulate_bsod == true || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout dokany
@@ -227,55 +266,49 @@ jobs:
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/share/swift || true
 
-      - name: Restore cached qcow2 for BSOD self-test
-        id: cache-img
-        uses: actions/cache@v6
+      - name: Restore cached qcow2 for crash self-test
+        uses: actions/cache/restore@v6
         with:
           path: ${{ runner.temp }}/kvm-images/${{ inputs.bsod_os || 'server2022' }}
-          key: kvm-win-${{ inputs.bsod_os || 'server2022' }}-v2-${{ hashFiles('scripts/ci_kvm/bake_image.sh', 'scripts/install_wlk_ifstest.ps1', 'cert/DokanCA.cer') }}
+          key: kvm-win-${{ inputs.bsod_os || 'server2022' }}-v3-${{ hashFiles('scripts/ci_kvm/bake_image.sh', 'scripts/install_wlk_ifstest.ps1', 'cert/DokanCA.cer') }}
+          fail-on-cache-miss: true
 
-      - name: Fail if image cache missing
-        if: steps.cache-img.outputs.cache-hit != 'true'
-        run: |
-          echo "::error::Expected cached KVM image for ${{ inputs.bsod_os || 'server2022' }}"
-          exit 1
-
-      - name: Download Dokan build artifacts
-        uses: actions/download-artifact@v7
-        with:
-          name: dokan-build-artifacts
-          path: ${{ runner.temp }}/dokan-artifacts
-
-      - name: Trigger controlled BugCheck and harvest MEMORY.DMP.7z
+      - name: Install QEMU/KVM
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-system-x86 qemu-utils openssh-client p7zip-full ntfs-3g socat zstd
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils openssh-client p7zip-full ntfs-3g socat unzip
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
+
+      - name: Trigger controlled crash/hang and harvest MEMORY.DMP.7z
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DOKAN_ARTIFACT_RUN_ID: ${{ github.run_id }}
+        run: |
           chmod +x scripts/ci_kvm/run_kvm_tests.sh
           ./scripts/ci_kvm/run_kvm_tests.sh \
             "${{ runner.temp }}/kvm-images/${{ inputs.bsod_os || 'server2022' }}" \
             "${{ runner.temp }}/dokan-artifacts" \
             "${{ runner.temp }}/kvm-results" \
             "shard1" \
-            "true"
+            "${{ inputs.bsod_mode || 'nmi' }}"
 
-      - name: Upload simulated BSOD crash dump
+      - name: Upload simulated crash dump
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: kvm-results-bsod-selftest-${{ inputs.bsod_os || 'server2022' }}
+          name: kvm-results-crash-selftest-${{ inputs.bsod_os || 'server2022' }}
           path: ${{ runner.temp }}/kvm-results/
           if-no-files-found: error
           retention-days: 3
 
   analyze-bsod:
-    name: Analyze BSOD MEMORY.DMP (kd.exe !analyze -v)
+    name: Analyze crash/hang MEMORY.DMP (kd.exe !analyze -v)
     needs: [build, kvm-test, kvm-bsod-selftest]
-    if: always() && (needs.kvm-test.result == 'failure' || needs.kvm-bsod-selftest.result == 'success')
+    if: always() && needs.build.result == 'success' && (needs.kvm-test.result == 'failure' || needs.kvm-bsod-selftest.result == 'success')
     runs-on: windows-2022
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - name: Checkout dokany
         uses: actions/checkout@v7
@@ -302,12 +335,12 @@ jobs:
             SymbolsDir  = "${{ runner.temp }}\dokan-artifacts"
             OutputDir   = "${{ runner.temp }}\bsod-reports"
           }
-          if ('${{ inputs.simulate_bsod }}' -eq 'true') {
+          if ('${{ needs.kvm-bsod-selftest.result }}' -eq 'success') {
             $analyzeArgs['RequireDump'] = $true
           }
           .\scripts\ci_kvm\analyze_bsod.ps1 @analyzeArgs
 
-      - name: Upload decoded BSOD analysis reports
+      - name: Upload decoded crash analysis reports
         if: always()
         uses: actions/upload-artifact@v7
         with:
