@@ -4,7 +4,9 @@ param(
     [ValidateSet('fail', 'warn')]
     [string]$XpassPolicy = 'fail',
     [switch]$SimulateBsod,
-    [switch]$SimulateHang
+    [switch]$SimulateHang,
+    [switch]$SkipInstall,
+    [int]$IdleMinutes = 0
 )
 
 $ErrorActionPreference = 'Stop'
@@ -30,6 +32,7 @@ if ($bcd -notmatch 'testsigning\s+Yes') {
 }
 Write-Host "TESTSIGNING = Yes [OK]"
 
+if (-not $SkipInstall) {
 Write-Host "=== Installing DokanSetup.exe ==="
 $t0 = Get-Date
 $installProc = Start-Process -PassThru -Wait -FilePath 'C:\ci\DokanSetup.exe' -ArgumentList @('/quiet', '/norestart', '/log', 'C:\ci\dokan_install.log')
@@ -48,6 +51,25 @@ if ($LASTEXITCODE -ne 0) {
 }
 if ($vq -notmatch 'dokan3\.sys') {
     throw "Driver Verifier is NOT monitoring dokan3.sys!"
+}
+}
+
+if ($IdleMinutes -gt 0) {
+    # PatchGuard canary: keep the guest alive and idle so a 0x109 that is unrelated to the FS workload shows up.
+    Write-Host "=== [CANARY] Idling $IdleMinutes min (Dokan installed: $(-not $SkipInstall)) ===" -ForegroundColor Cyan
+    for ($m = 1; $m -le $IdleMinutes; $m++) {
+        Start-Sleep -Seconds 60
+        $uptime = [int]((Get-Date) - (Get-CimInstance Win32_OperatingSystem).LastBootUpTime).TotalMinutes
+        Write-Host "[canary] +${m}m alive (guest uptime ${uptime}m)"
+        [Console]::Out.Flush()
+    }
+    $bugchecks = Get-WinEvent -FilterHashtable @{ LogName = 'System'; Id = 1001; ProviderName = 'Microsoft-Windows-WER-SystemErrorReporting' } -ErrorAction SilentlyContinue
+    if ($bugchecks) {
+        $bugchecks | Format-List TimeCreated, Message | Out-String | Write-Error
+        throw "BugCheck event detected during canary idle!"
+    }
+    Write-Host "=== [CANARY] No BugCheck after $IdleMinutes idle minutes ===" -ForegroundColor Green
+    exit 0
 }
 
 if ($SimulateHang) {

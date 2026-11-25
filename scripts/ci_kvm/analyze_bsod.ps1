@@ -87,6 +87,8 @@ foreach ($archive in $dumps) {
             'dv /t /i /V'
             '.echo === DOKAN3 MODULE ==='
             'lmvm dokan3'
+            '.echo === RUNNING THREADS ON ALL CPUS (hang triage) ==='
+            '!running -it'
             '.echo === LOCKS (hang triage) ==='
             '!locks'
             '.echo === DOKAN THREAD STACKS (hang triage) ==='

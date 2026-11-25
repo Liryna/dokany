@@ -11,7 +11,7 @@
 # MEMORY.DMP of the hung state, which is then harvested like any other BugCheck.
 set -euo pipefail
 
-usage='usage: run_kvm_tests.sh <image_dir> <artifacts_dir> <results_dir> [shard] [simulate: false|bugcheck|nmi]'
+usage='usage: run_kvm_tests.sh <image_dir> <artifacts_dir> <results_dir> [shard] [mode: false|bugcheck|nmi|idle|idle-dokan]'
 IMAGE_DIR="${1:?$usage}"
 ARTIFACTS_DIR="${2:?$usage}"
 RESULTS_DIR="${3:?$usage}"
@@ -19,9 +19,13 @@ SHARD="${4:-all}"
 SIMULATE="${5:-false}"
 case "$SIMULATE" in
   true|bugcheck) SIMULATE="bugcheck" ;;
-  false|nmi) ;;
-  *) echo "ERROR: invalid simulate mode '$SIMULATE'" >&2; exit 2 ;;
+  false|nmi|idle|idle-dokan) ;;
+  *) echo "ERROR: invalid mode '$SIMULATE'" >&2; exit 2 ;;
 esac
+CANARY_IDLE_MINUTES="${CANARY_IDLE_MINUTES:-20}"
+# Default CPU model; QEMU_CPU overrides it (e.g. to test additional Hyper-V enlightenments)
+QEMU_CPU="${QEMU_CPU:-host,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time}"
+echo "QEMU CPU model: $QEMU_CPU"
 
 GUEST_TEST_TIMEOUT="${GUEST_TEST_TIMEOUT:-2700}"
 if [[ "$SIMULATE" == "nmi" ]]; then
@@ -67,7 +71,7 @@ start_qemu() {
   qemu-system-x86_64 \
     -enable-kvm \
     -machine q35,accel=kvm \
-    -cpu host,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time \
+    -cpu "$QEMU_CPU" \
     -smp 4 \
     -m 6G \
     -display none \
@@ -182,18 +186,21 @@ T_BOOT1=$(date +%s)
 echo "=== [$(date -u +%T)] Guest SSH ready in $((T_BOOT1 - T_BOOT0))s ==="
 
 T_ART0=$(date +%s)
-fetch_build_artifacts
+if [[ "$SIMULATE" != "idle" ]]; then
+  fetch_build_artifacts
+fi
 T_ART1=$(date +%s)
 echo "=== [$(date -u +%T)] Build artifacts ready (waited $((T_ART1 - T_ART0))s after guest boot) ==="
 
 echo "=== [$(date -u +%T)] Copying build artifacts and test scripts into guest ==="
 ssh "${SSH_OPTS[@]}" Administrator@127.0.0.1 'New-Item -ItemType Directory -Force -Path C:\ci | Out-Null'
 scp "${SCP_OPTS[@]}" \
-  "$ARTIFACTS_DIR/DokanSetup.exe" \
-  "$ARTIFACTS_DIR/fsx.exe" \
   "$REPO_ROOT/scripts/run_ifstest.ps1" \
   "$REPO_ROOT/scripts/ci_kvm/guest_test.ps1" \
   "Administrator@127.0.0.1:C:/ci/"
+if [[ "$SIMULATE" != "idle" ]]; then
+  scp "${SCP_OPTS[@]}" "$ARTIFACTS_DIR/DokanSetup.exe" "$ARTIFACTS_DIR/fsx.exe" "Administrator@127.0.0.1:C:/ci/"
+fi
 
 if [[ -f "$ARTIFACTS_DIR/dokan_fstest.exe" ]]; then
   echo "Staging dokan_fstest.exe + baselines into guest..."
@@ -207,6 +214,8 @@ GUEST_CMD="& C:\ci\guest_test.ps1 -Shard '${SHARD}'"
 case "$SIMULATE" in
   bugcheck) GUEST_CMD="${GUEST_CMD} -SimulateBsod" ;;
   nmi) GUEST_CMD="${GUEST_CMD} -SimulateHang" ;;
+  idle) GUEST_CMD="${GUEST_CMD} -SkipInstall -IdleMinutes ${CANARY_IDLE_MINUTES}" ;;
+  idle-dokan) GUEST_CMD="${GUEST_CMD} -IdleMinutes ${CANARY_IDLE_MINUTES}" ;;
 esac
 
 echo "=== [$(date -u +%T)] Executing Dokan install + Driver Verifier + FS tests (${GUEST_CMD}, timeout ${GUEST_TEST_TIMEOUT}s) ==="
@@ -342,7 +351,7 @@ if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
   echo "bsod_detected=${BSOD_HARVESTED}" >> "$GITHUB_OUTPUT"
 fi
 
-if [[ "$SIMULATE" != "false" ]]; then
+if [[ "$SIMULATE" == "bugcheck" || "$SIMULATE" == "nmi" ]]; then
   if [[ "$BSOD_HARVESTED" == "true" ]]; then
     echo "=== SIMULATED ${SIMULATE^^} SELF-TEST: MEMORY.DMP.7z successfully harvested ==="
     exit 0

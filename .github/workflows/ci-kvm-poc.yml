@@ -198,7 +198,7 @@ jobs:
           key: kvm-win-${{ matrix.os }}-v3-${{ hashFiles('scripts/ci_kvm/bake_image.sh', 'scripts/install_wlk_ifstest.ps1', 'cert/DokanCA.cer') }}
 
   kvm-test:
-    name: Kernel + Driver Verifier (${{ matrix.os }} / ${{ matrix.shard }})
+    name: Kernel + Driver Verifier (${{ matrix.os }} / ${{ matrix.shard }}${{ matrix.cpu != 'default' && format(' / cpu={0}', matrix.cpu) || '' }})
     # Deliberately NOT 'needs: build': the guest restores + boots while Windows builds,
     # then run_kvm_tests.sh polls for this run's 'dokan-build-artifacts'.
     needs: [kvm-image]
@@ -215,6 +215,13 @@ jobs:
         shard:
           - shard1
           - shard2
+        cpu:
+          - default
+        include:
+          # Experiment: full Hyper-V enlightenment set on the leg that hit PatchGuard 0x109 twice
+          - os: server2025
+            shard: shard1
+            cpu: full-hv
     steps:
       - name: Checkout dokany
         uses: actions/checkout@v7
@@ -245,6 +252,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           DOKAN_ARTIFACT_RUN_ID: ${{ github.run_id }}
+          QEMU_CPU: ${{ matrix.cpu == 'full-hv' && 'host,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time,hv_vpindex,hv_runtime,hv_synic,hv_stimer,hv_frequencies,hv_reset,hv_ipi,hv_tlbflush' || '' }}
         run: |
           chmod +x scripts/ci_kvm/run_kvm_tests.sh
           ./scripts/ci_kvm/run_kvm_tests.sh \
@@ -258,7 +266,67 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: kvm-results-${{ matrix.os }}-${{ matrix.shard }}
+          name: kvm-results-${{ matrix.os }}-${{ matrix.shard }}-${{ matrix.cpu }}
+          path: ${{ runner.temp }}/kvm-results/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  kvm-canary:
+    name: PatchGuard canary (server2025 / ${{ matrix.mode }})
+    # Splits 'dokan3.sys / workload' from 'KVM-on-Azure environment' for the Server 2025 0x109 hangs:
+    #   idle       = no Dokan installed, guest idles 20 min
+    #   idle-dokan = Dokan installed under Driver Verifier, no FS workload, guest idles 20 min
+    needs: [kvm-image]
+    if: inputs.simulate_bsod != true
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode:
+          - idle
+          - idle-dokan
+    steps:
+      - name: Checkout dokany
+        uses: actions/checkout@v7
+
+      - name: Reclaim runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/share/swift || true
+
+      - name: Restore cached server2025 qcow2
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/kvm-images/server2025
+          key: kvm-win-server2025-v3-${{ hashFiles('scripts/ci_kvm/bake_image.sh', 'scripts/install_wlk_ifstest.ps1', 'cert/DokanCA.cer') }}
+          fail-on-cache-miss: true
+
+      - name: Install QEMU/KVM
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils openssh-client p7zip-full ntfs-3g socat unzip
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Idle the guest and watch for BugChecks/hangs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DOKAN_ARTIFACT_RUN_ID: ${{ github.run_id }}
+          CANARY_IDLE_MINUTES: '20'
+        run: |
+          chmod +x scripts/ci_kvm/run_kvm_tests.sh
+          ./scripts/ci_kvm/run_kvm_tests.sh \
+            "${{ runner.temp }}/kvm-images/server2025" \
+            "${{ runner.temp }}/dokan-artifacts" \
+            "${{ runner.temp }}/kvm-results" \
+            "all" \
+            "${{ matrix.mode }}"
+
+      - name: Upload canary logs and crash dumps (if any)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kvm-results-canary-${{ matrix.mode }}
           path: ${{ runner.temp }}/kvm-results/
           if-no-files-found: ignore
           retention-days: 7
@@ -266,8 +334,7 @@ jobs:
   kvm-bsod-selftest:
     name: Crash Capture Self-Test (${{ inputs.bsod_os || 'server2022' }} / ${{ inputs.bsod_mode || 'nmi' }})
     needs: [kvm-image]
-    # TEMP(PoC): also runs on pull_request to prove the NMI hang-dump path once; gate back to dispatch-only afterwards.
-    if: inputs.simulate_bsod == true || github.event_name == 'pull_request'
+    if: inputs.simulate_bsod == true
     runs-on: ubuntu-latest
     steps:
       - name: Checkout dokany
@@ -316,8 +383,8 @@ jobs:
 
   analyze-bsod:
     name: Analyze crash/hang MEMORY.DMP (kd.exe !analyze -v)
-    needs: [build, kvm-test, kvm-bsod-selftest]
-    if: always() && needs.build.result == 'success' && (needs.kvm-test.result == 'failure' || needs.kvm-bsod-selftest.result == 'success')
+    needs: [build, kvm-test, kvm-canary, kvm-bsod-selftest]
+    if: always() && needs.build.result == 'success' && (needs.kvm-test.result == 'failure' || needs.kvm-canary.result == 'failure' || needs.kvm-bsod-selftest.result == 'success')
     runs-on: windows-2022
     timeout-minutes: 15
     steps:
