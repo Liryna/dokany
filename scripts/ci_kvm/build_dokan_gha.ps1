@@ -152,6 +152,7 @@ $setupExe = "$repoRoot\dokan_wix\Bootstrapper\bin\x86\$BuildConfig\DokanSetup.ex
 Copy-Item -LiteralPath $setupExe -Destination "$outAbs\DokanSetup.exe" -Force
 Copy-Item -LiteralPath "$fstoolsDir\src\fsx\fsx.exe" -Destination "$outAbs\fsx.exe" -Force
 Copy-Item -LiteralPath "$repoRoot\x64\$BuildConfig\Driver\dokan3.pdb" -Destination "$outAbs\dokan3.pdb" -Force
+Copy-Item -LiteralPath "$repoRoot\x64\$BuildConfig\Driver\dokan3.sys" -Destination "$outAbs\dokan3.sys" -Force
 Copy-Item -LiteralPath "$repoRoot\cert\DokanCA.cer" -Destination "$outAbs\DokanCA.cer" -Force
 
 if ($hasDokanFsTest) {

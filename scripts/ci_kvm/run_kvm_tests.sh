@@ -26,6 +26,7 @@ CANARY_IDLE_MINUTES="${CANARY_IDLE_MINUTES:-20}"
 # Default CPU model; QEMU_CPU overrides it (e.g. to test additional Hyper-V enlightenments)
 QEMU_CPU="${QEMU_CPU:-host,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time}"
 echo "QEMU CPU model: $QEMU_CPU"
+echo "Host CPU: $(lscpu | sed -n 's/^Model name:[[:space:]]*//p' | head -n1)"
 
 GUEST_TEST_TIMEOUT="${GUEST_TEST_TIMEOUT:-2700}"
 if [[ "$SIMULATE" == "nmi" ]]; then

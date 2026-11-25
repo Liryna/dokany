@@ -70,7 +70,7 @@ jobs:
           $symCache = "$env:RUNNER_TEMP\symcache"
           New-Item -ItemType Directory -Force -Path $symCache, "$env:RUNNER_TEMP\out" | Out-Null
           $symPath = "$env:RUNNER_TEMP\symbols;srv*$symCache*https://msdl.microsoft.com/download/symbols"
-          $out = @(& $kd -lines -z $dmp.FullName -y $symPath -cf "$env:RUNNER_TEMP\kd_commands.txt" 2>&1)
+          $out = @(& $kd -lines -z $dmp.FullName -y $symPath -i "$env:RUNNER_TEMP\symbols" -cf "$env:RUNNER_TEMP\kd_commands.txt" 2>&1)
           [System.IO.File]::WriteAllText("$env:RUNNER_TEMP\out\kd-query-output.txt", ($out -join "`n"), (New-Object System.Text.UTF8Encoding($false)))
           $out | Where-Object { $_ -notmatch 'not present in the dump file' } | ForEach-Object { Write-Host $_ }
 

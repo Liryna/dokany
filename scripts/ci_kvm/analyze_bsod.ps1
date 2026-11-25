@@ -98,7 +98,7 @@ foreach ($archive in $dumps) {
             'q'
         )
         [System.IO.File]::WriteAllText($kdScriptPath, ($kdScriptLines -join "`r`n") + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
-        $rawOut = @(& $debuggerExe -lines -z $dmpFile.FullName -y $symPath -cf $kdScriptPath 2>&1)
+        $rawOut = @(& $debuggerExe -lines -z $dmpFile.FullName -y $symPath -i $SymbolsDir -cf $kdScriptPath 2>&1)
         $kdRc = $LASTEXITCODE
         $fullText = ($rawOut -join "`n")
         [System.IO.File]::WriteAllText($analysisTxt, $fullText, (New-Object System.Text.UTF8Encoding($false)))
