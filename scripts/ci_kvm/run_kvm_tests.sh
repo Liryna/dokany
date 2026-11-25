@@ -11,10 +11,23 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK_DIR="${RUNNER_TEMP:-/tmp}/kvm-test-run"
 mkdir -p "$WORK_DIR" "$RESULTS_DIR"
 
-BASE_IMG="$IMAGE_DIR/base.qcow2"
 SSH_KEY="$IMAGE_DIR/id_ed25519"
 OVERLAY_IMG="$WORK_DIR/overlay.qcow2"
 SERIAL_LOG="$RESULTS_DIR/serial.log"
+
+if [[ -f "$IMAGE_DIR/base.qcow2.zst" ]]; then
+  BASE_IMG="$WORK_DIR/base.qcow2"
+  echo "=== [$(date -u +%T)] Decompressing cached base.qcow2.zst ==="
+  T_DEC0=$(date +%s)
+  zstd -d --long=27 -T0 -f "$IMAGE_DIR/base.qcow2.zst" -o "$BASE_IMG"
+  T_DEC1=$(date +%s)
+  echo "Decompressed $(du -h "$IMAGE_DIR/base.qcow2.zst" | awk '{print $1}') -> $(du -h "$BASE_IMG" | awk '{print $1}') in $((T_DEC1 - T_DEC0))s"
+elif [[ -f "$IMAGE_DIR/base.qcow2" ]]; then
+  BASE_IMG="$IMAGE_DIR/base.qcow2"
+else
+  echo "ERROR: Neither $IMAGE_DIR/base.qcow2.zst nor $IMAGE_DIR/base.qcow2 found!" >&2
+  exit 1
+fi
 
 chmod 600 "$SSH_KEY"
 rm -f "$OVERLAY_IMG"

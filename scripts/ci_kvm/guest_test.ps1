@@ -19,6 +19,9 @@ function Exec-External {
 $cv = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 Write-Host "=== Guest OS: $($cv.ProductName) (Build $($cv.CurrentBuildNumber).$($cv.UBR), Arch $($env:PROCESSOR_ARCHITECTURE), Shard=$Shard) ===" -ForegroundColor Cyan
 
+# Disable ClearPageFileAtShutdown (used only during image bake) so test shutdowns are instant
+Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' -Name 'ClearPageFileAtShutdown' -Type DWord -Value 0 -ErrorAction SilentlyContinue
+
 Write-Host "=== Verifying TESTSIGNING is active ==="
 $bcd = (& bcdedit.exe /enum '{current}' | Out-String)
 if ($bcd -notmatch 'testsigning\s+Yes') {

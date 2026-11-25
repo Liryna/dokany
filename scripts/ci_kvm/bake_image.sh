@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-OS_ID="${1:?usage: bake_image.sh <server2025|server2022|server2019> <output_dir>}"
-OUT_DIR="${2:?usage: bake_image.sh <server2025|server2022|server2019> <output_dir>}"
+OS_ID="${1:?usage: bake_image.sh <server2025|server2022|server2019|server2016> <output_dir>}"
+OUT_DIR="${2:?usage: bake_image.sh <server2025|server2022|server2019|server2016> <output_dir>}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK_DIR="${RUNNER_TEMP:-/tmp}/kvm-bake-${OS_ID}"
@@ -20,6 +20,10 @@ case "$OS_ID" in
   server2019)
     ISO_URL="https://go.microsoft.com/fwlink/?linkid=2195167&clcid=0x409&culture=en-us&country=us"
     IMAGE_INDEX="1" # Windows Server 2019 Standard Evaluation (Server Core)
+    ;;
+  server2016)
+    ISO_URL="https://software-download.microsoft.com/download/pr/Windows_Server_2016_Datacenter_EVAL_en-us_14393_refresh.ISO"
+    IMAGE_INDEX="1" # Windows Server 2016 Standard Evaluation (Server Core)
     ;;
   *)
     echo "ERROR: Unsupported OS_ID '$OS_ID'" >&2
@@ -225,8 +229,10 @@ try {
     Set-ItemProperty -Path $cc -Name 'DumpFile' -Type ExpandString -Value '%SystemRoot%\MEMORY.DMP'
     Set-ItemProperty -Path $cc -Name 'Overwrite' -Type DWord -Value 1
     Set-ItemProperty -Path $cc -Name 'AutoReboot' -Type DWord -Value 1
-    # Ensure pagefile is large enough on C: for kernel memory dump
-    Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management' -Name 'PagingFiles' -Type MultiString -Value @('C:\pagefile.sys 2048 4096')
+    # Ensure pagefile is large enough on C: for kernel memory dump, and zero it on bake shutdown so qemu-img drops it
+    $mmKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management'
+    Set-ItemProperty -Path $mmKey -Name 'PagingFiles' -Type MultiString -Value @('C:\pagefile.sys 2048 4096')
+    Set-ItemProperty -Path $mmKey -Name 'ClearPageFileAtShutdown' -Type DWord -Value 1
 
     # 5. Install Win32-OpenSSH from local seed copy
     Log "Installing Win32-OpenSSH..."
@@ -288,11 +294,29 @@ try {
     Remove-Item -Path 'C:\Windows\Temp\wlk_inst' -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -Path $localSeed -Recurse -Force -ErrorAction SilentlyContinue
 
-    # 7. Shrink disk before shutdown so zstd qcow2 compresses cleanly
-    Log "Cleaning temp files and zeroing free space for compression..."
-    Remove-Item -Path 'C:\Windows\Temp\*' -Recurse -Force -ErrorAction SilentlyContinue
+    # 7. Shrink OS component store and zero free space before shutdown for maximum zstd deduplication
+    Log "Running DISM StartComponentCleanup /ResetBase..."
+    $tDism = Get-Date
+    $dismOut = (& dism.exe /Online /Cleanup-Image /StartComponentCleanup /ResetBase 2>&1 | Out-String).Trim()
+    Log "DISM exit=${LASTEXITCODE} in $([int]((Get-Date) - $tDism).TotalSeconds)s"
+    if ($LASTEXITCODE -ne 0) {
+        Log "DISM warning output: $dismOut"
+    }
+
+    Log "Cleaning temp, update cache, and log files..."
+    foreach ($cleanDir in @(
+        'C:\Windows\Temp\*',
+        'C:\Windows\SoftwareDistribution\Download\*',
+        'C:\Windows\Logs\CBS\*',
+        'C:\Windows\Logs\DISM\*',
+        'C:\Windows\Panther\UnattendGC\*'
+    )) {
+        Remove-Item -Path $cleanDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
     # Disable hibernation to eliminate hiberfil.sys
     & powercfg.exe /h off | Out-Null
+
+    Log "Zeroing free space for sparse hole-punching..."
 
     # Zero free blocks using a sparse-disabled zero stream (capped to avoid filling disk)
     $drive = Get-PSDrive C
@@ -351,9 +375,9 @@ tail -f "$SERIAL_LOG" &
 TAIL_PID=$!
 trap 'kill $TAIL_PID 2>/dev/null || true' EXIT
 
-# Timeout at 20 minutes so a stuck install never hangs the runner
+# Timeout at 30 minutes (includes DISM /StartComponentCleanup /ResetBase)
 set +e
-timeout 1200 qemu-system-x86_64 \
+timeout 1800 qemu-system-x86_64 \
   -enable-kvm \
   -machine q35,accel=kvm \
   -cpu host,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time \
@@ -388,14 +412,16 @@ echo "=== [$(date -u +%T)] Removing Windows ISO to free space before compression
 rm -f "$WORK_DIR/windows.iso" "$WORK_DIR/seed.iso"
 df -h / "$WORK_DIR"
 
-echo "=== [$(date -u +%T)] Compressing base image with qcow2 zstd ==="
+echo "=== [$(date -u +%T)] Sparsifying qcow2 (dropping zeroed free space & pagefile) + zstd --long=27 compression ==="
 T_COMP0=$(date +%s)
-qemu-img convert -O qcow2 -c -o compression_type=zstd "$WORK_DIR/base-raw.qcow2" "$OUT_DIR/base.qcow2"
-T_COMP1=$(date +%s)
+qemu-img convert -O qcow2 "$WORK_DIR/base-raw.qcow2" "$WORK_DIR/base-sparse.qcow2"
 rm -f "$WORK_DIR/base-raw.qcow2"
+echo "Sparse uncompressed qcow2 size: $(du -h "$WORK_DIR/base-sparse.qcow2" | awk '{print $1}')"
+rm -f "$OUT_DIR/base.qcow2" "$OUT_DIR/base.qcow2.zst"
+zstd -11 --long=27 -T0 --rm "$WORK_DIR/base-sparse.qcow2" -o "$OUT_DIR/base.qcow2.zst"
+T_COMP1=$(date +%s)
 
 echo "=== [$(date -u +%T)] Image bake complete! ==="
-echo "Raw install+provision time: $((T_END - T_BOOT))s"
-echo "zstd compression time:      $((T_COMP1 - T_COMP0))s"
-ls -lh "$OUT_DIR/base.qcow2"
-qemu-img info "$OUT_DIR/base.qcow2"
+echo "Raw install+provision+DISM time: $((T_END - T_BOOT))s"
+echo "Sparsify + zstd --long=27 time:  $((T_COMP1 - T_COMP0))s"
+ls -lh "$OUT_DIR/base.qcow2.zst"
