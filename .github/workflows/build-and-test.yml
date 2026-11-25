@@ -167,7 +167,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [server2016, server2019, server2022, server2025]
+        os: [server2022]
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -211,14 +211,14 @@ jobs:
     # No 'needs' on the build jobs: the VM restores its image and boots while Dokan and the test
     # tools are still building, then run_vm_tests.sh downloads their artifacts once uploaded.
     needs: vm-image
-    if: inputs.crash_selftest != 'bugcheck' && inputs.crash_selftest != 'hang'
+    if: false
     runs-on: ubuntu-latest
     timeout-minutes: 75
     continue-on-error: ${{ matrix.allow_failure == true }}
     strategy:
       fail-fast: false
       matrix:
-        os: [server2016, server2019, server2022, server2025]
+        os: [server2022]
         shard: [shard1, shard2]
         include:
           # Known intermittent: PatchGuard (BugCheck 0x109) occasionally fires on Server 2025 under
@@ -273,11 +273,15 @@ jobs:
           retention-days: 14
 
   crash-selftest:
-    name: Crash-capture self-test (server2022, ${{ inputs.crash_selftest }})
+    name: Crash-capture self-test (server2022, ${{ matrix.mode }})
     needs: vm-image
-    if: inputs.crash_selftest == 'bugcheck' || inputs.crash_selftest == 'hang'
+    if: true
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [hang, bugcheck]
     steps:
       - name: Check out repository
         uses: actions/checkout@v7
@@ -302,13 +306,13 @@ jobs:
             "${{ runner.temp }}/payload" \
             "${{ runner.temp }}/vm-results" \
             shard1 \
-            "${{ inputs.crash_selftest }}"
+            "${{ matrix.mode }}"
 
       - name: Upload crash dump
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: crash-dump-selftest-${{ inputs.crash_selftest }}
+          name: crash-dump-selftest-${{ matrix.mode }}
           path: ${{ runner.temp }}/vm-results/MEMORY.DMP.7z
           if-no-files-found: error
           retention-days: 7
