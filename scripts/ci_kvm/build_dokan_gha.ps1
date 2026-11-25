@@ -2,7 +2,8 @@ param(
     [ValidateSet('Release', 'Debug')]
     [string]$BuildConfig = 'Release',
     [string]$BuildNumber = '1',
-    [string]$OutputDir = 'ci-artifacts'
+    [string]$OutputDir = 'ci-artifacts',
+    [string]$FsTestDepsCacheDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -110,13 +111,45 @@ try {
     Pop-Location
 }
 
-# 10. Stage artifacts
+# 10. Auto-detect and build dokan_fstest.exe (PR #1365+) with static CRT (/MT) if present
+$buildFsTestScript = Join-Path $repoRoot 'scripts\build_fstest.ps1'
+$hasDokanFsTest = (Test-Path -LiteralPath $buildFsTestScript -PathType Leaf) -and (Test-Path -LiteralPath "$repoRoot\tests\fstest\CMakeLists.txt" -PathType Leaf)
+if ($hasDokanFsTest) {
+    Write-Host "Detected tests/fstest; building dokan_fstest.exe ($BuildConfig, static CRT)..."
+    $fsBuildArgs = @{
+        Configuration   = $BuildConfig
+        VerifyStaticCrt = $true
+    }
+    if (-not [string]::IsNullOrWhiteSpace($FsTestDepsCacheDir)) {
+        $fsBuildArgs['CacheDir'] = $FsTestDepsCacheDir
+    }
+    & $buildFsTestScript @fsBuildArgs
+    if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+        throw "scripts\build_fstest.ps1 failed with exit code $LASTEXITCODE"
+    }
+} else {
+    Write-Host "tests/fstest not present on this branch; skipping dokan_fstest.exe build."
+}
+
+# 11. Stage artifacts
 $outAbs = Join-Path $repoRoot $OutputDir
 New-Item -ItemType Directory -Force -Path $outAbs | Out-Null
 Copy-Item -LiteralPath "$repoRoot\dokan_wix\Bootstrapper\bin\x86\$BuildConfig\DokanSetup.exe" -Destination "$outAbs\DokanSetup.exe" -Force
 Copy-Item -LiteralPath "$fstoolsDir\src\fsx\fsx.exe" -Destination "$outAbs\fsx.exe" -Force
 Copy-Item -LiteralPath "$repoRoot\x64\$BuildConfig\Driver\dokan3.pdb" -Destination "$outAbs\dokan3.pdb" -Force
 Copy-Item -LiteralPath "$repoRoot\cert\DokanCA.cer" -Destination "$outAbs\DokanCA.cer" -Force
+
+if ($hasDokanFsTest) {
+    $fsTestExePath = "$repoRoot\tests\fstest\build\bin\$BuildConfig\dokan_fstest.exe"
+    if (-not (Test-Path -LiteralPath $fsTestExePath -PathType Leaf)) {
+        throw "Expected dokan_fstest.exe not found at $fsTestExePath"
+    }
+    Copy-Item -LiteralPath $fsTestExePath -Destination "$outAbs\dokan_fstest.exe" -Force
+    $baselinesSrc = "$repoRoot\tests\fstest\baselines"
+    if (Test-Path -LiteralPath $baselinesSrc -PathType Container) {
+        Copy-Item -LiteralPath $baselinesSrc -Destination "$outAbs\baselines" -Recurse -Force
+    }
+}
 
 Write-Host "Staged build artifacts in ${outAbs}:"
 Get-ChildItem -LiteralPath $outAbs | Format-Table Name, Length

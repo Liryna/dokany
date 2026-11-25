@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-IMAGE_DIR="${1:?usage: run_kvm_tests.sh <image_dir> <artifacts_dir> <results_dir>}"
-ARTIFACTS_DIR="${2:?usage: run_kvm_tests.sh <image_dir> <artifacts_dir> <results_dir>}"
-RESULTS_DIR="${3:?usage: run_kvm_tests.sh <image_dir> <artifacts_dir> <results_dir>}"
+IMAGE_DIR="${1:?usage: run_kvm_tests.sh <image_dir> <artifacts_dir> <results_dir> [shard] [simulate_bsod]}"
+ARTIFACTS_DIR="${2:?usage: run_kvm_tests.sh <image_dir> <artifacts_dir> <results_dir> [shard] [simulate_bsod]}"
+RESULTS_DIR="${3:?usage: run_kvm_tests.sh <image_dir> <artifacts_dir> <results_dir> [shard] [simulate_bsod]}"
+SHARD="${4:-all}"
+SIMULATE_BSOD="${5:-false}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 WORK_DIR="${RUNNER_TEMP:-/tmp}/kvm-test-run"
@@ -28,7 +30,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "=== [$(date -u +%T)] Booting network-isolated KVM guest (restrict=on) ==="
+echo "=== [$(date -u +%T)] Booting network-isolated KVM guest (restrict=on, shard=${SHARD}, simulate_bsod=${SIMULATE_BSOD}) ==="
 T_BOOT0=$(date +%s)
 qemu-system-x86_64 \
   -enable-kvm \
@@ -61,7 +63,7 @@ SCP_OPTS=(
   -i "$SSH_KEY"
   -o StrictHostKeyChecking=no
   -o UserKnownHostsFile=/dev/null
-  -o ConnectTimeout=5
+  -o ConnectTimeout=10
   -o BatchMode=yes
   -P 2222
 )
@@ -106,21 +108,52 @@ scp "${SCP_OPTS[@]}" \
   "$REPO_ROOT/scripts/ci_kvm/guest_test.ps1" \
   "Administrator@127.0.0.1:C:/ci/"
 
-echo "=== [$(date -u +%T)] Executing Dokan install + Driver Verifier + FS tests ==="
+if [[ -f "$ARTIFACTS_DIR/dokan_fstest.exe" ]]; then
+  echo "Staging dokan_fstest.exe + baselines into guest..."
+  scp "${SCP_OPTS[@]}" "$ARTIFACTS_DIR/dokan_fstest.exe" "Administrator@127.0.0.1:C:/ci/"
+  if [[ -d "$ARTIFACTS_DIR/baselines" ]]; then
+    scp "${SCP_OPTS[@]}" -r "$ARTIFACTS_DIR/baselines" "Administrator@127.0.0.1:C:/ci/"
+  fi
+fi
+
+GUEST_CMD="& C:\ci\guest_test.ps1 -Shard '${SHARD}'"
+if [[ "$SIMULATE_BSOD" == "true" ]]; then
+  GUEST_CMD="${GUEST_CMD} -SimulateBsod"
+fi
+
+echo "=== [$(date -u +%T)] Executing Dokan install + Driver Verifier + FS tests (${GUEST_CMD}) ==="
 T_TEST0=$(date +%s)
 set +e
-ssh "${SSH_OPTS[@]}" Administrator@127.0.0.1 '& C:\ci\guest_test.ps1'
+ssh "${SSH_OPTS[@]}" Administrator@127.0.0.1 "$GUEST_CMD"
 TEST_RC=$?
 set -e
 T_TEST1=$(date +%s)
 echo "=== [$(date -u +%T)] Guest test script exited with code $TEST_RC in $((T_TEST1 - T_TEST0))s ==="
 
-# Harvest logs and check for BSOD (even if SSH dropped mid-test due to a bugcheck!)
+# Harvest logs, fstest scorecards, and check for BSOD (even if SSH dropped mid-test due to a bugcheck!)
+BSOD_HARVESTED="false"
 harvest_bsod_if_any() {
-  echo "Checking for BSOD / MEMORY.DMP..."
-  if wait_for_ssh 90; then
+  echo "=== [$(date -u +%T)] Checking for BSOD / MEMORY.DMP and harvesting logs ==="
+  # If SSH dropped (e.g. rc=255 during BSOD), give Windows a few seconds to begin writing crash dump + rebooting
+  if [[ $TEST_RC -ne 0 ]]; then
+    sleep 8
+  fi
+  if wait_for_ssh 180; then
     local bsod_check_rc=0
     ssh "${SSH_OPTS[@]}" Administrator@127.0.0.1 '
+      # Wait up to 45s for SaveDump/WER to finish copying pagefile to C:\Windows\MEMORY.DMP after reboot
+      for ($w = 0; $w -lt 15; $w++) {
+        if (Test-Path "C:\Windows\MEMORY.DMP") {
+          $len1 = (Get-Item "C:\Windows\MEMORY.DMP").Length
+          Start-Sleep -Seconds 3
+          $len2 = (Get-Item "C:\Windows\MEMORY.DMP").Length
+          if ($len2 -gt 0 -and $len1 -eq $len2) { break }
+        } else {
+          $bc = Get-WinEvent -FilterHashtable @{LogName="System"; Id=1001; ProviderName="Microsoft-Windows-WER-SystemErrorReporting"} -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $bc -and $w -ge 2) { break }
+          Start-Sleep -Seconds 3
+        }
+      }
       $bugchecks = Get-WinEvent -FilterHashtable @{LogName="System"; Id=1001; ProviderName="Microsoft-Windows-WER-SystemErrorReporting"} -ErrorAction SilentlyContinue | Select-Object -First 3
       if ($bugchecks) {
         Write-Host "=== BUGCHECK DETECTED IN EVENT LOG ==="
@@ -131,15 +164,23 @@ harvest_bsod_if_any() {
         exit 42
       }
     ' || bsod_check_rc=$?
+    scp "${SCP_OPTS[@]}" "Administrator@127.0.0.1:C:/ci/dokan_install*.log" "$RESULTS_DIR/" 2>/dev/null || true
+    scp "${SCP_OPTS[@]}" -r "Administrator@127.0.0.1:C:/ci/fstest-results" "$RESULTS_DIR/" 2>/dev/null || true
     if [[ $bsod_check_rc -eq 42 ]]; then
       echo "Downloading C:\Windows\MEMORY.DMP from guest..."
+      T_DMP0=$(date +%s)
       scp "${SCP_OPTS[@]}" "Administrator@127.0.0.1:C:/Windows/MEMORY.DMP" "$WORK_DIR/MEMORY.DMP"
-      7z a -t7z "$RESULTS_DIR/MEMORY.DMP.7z" "$WORK_DIR/MEMORY.DMP"
+      ls -lh "$WORK_DIR/MEMORY.DMP"
+      7z a -t7z -mx=3 "$RESULTS_DIR/MEMORY.DMP.7z" "$WORK_DIR/MEMORY.DMP" >/dev/null
       rm -f "$WORK_DIR/MEMORY.DMP"
-      echo "Saved compressed crash dump to $RESULTS_DIR/MEMORY.DMP.7z"
+      T_DMP1=$(date +%s)
+      echo "Saved compressed crash dump to $RESULTS_DIR/MEMORY.DMP.7z ($(du -h "$RESULTS_DIR/MEMORY.DMP.7z" | awk '{print $1}')) in $((T_DMP1 - T_DMP0))s"
+      BSOD_HARVESTED="true"
+      echo "BSOD_DETECTED" > "$RESULTS_DIR/BSOD_DETECTED"
+      ssh "${SSH_OPTS[@]}" Administrator@127.0.0.1 'shutdown /s /t 0' 2>/dev/null || true
+      wait "$QEMU_PID" 2>/dev/null || true
       return 1
     fi
-    scp "${SCP_OPTS[@]}" "Administrator@127.0.0.1:C:/ci/dokan_install*.log" "$RESULTS_DIR/" 2>/dev/null || true
     ssh "${SSH_OPTS[@]}" Administrator@127.0.0.1 'shutdown /s /t 0' 2>/dev/null || true
     wait "$QEMU_PID" 2>/dev/null || true
     return 0
@@ -155,9 +196,12 @@ harvest_bsod_if_any() {
       if sudo mount -o ro /dev/nbd0p2 "$WORK_DIR/mnt" 2>/dev/null; then
         if [[ -f "$WORK_DIR/mnt/Windows/MEMORY.DMP" ]]; then
           echo "Found offline C:\Windows\MEMORY.DMP!"
-          7z a -t7z "$RESULTS_DIR/MEMORY.DMP.7z" "$WORK_DIR/mnt/Windows/MEMORY.DMP"
+          7z a -t7z -mx=3 "$RESULTS_DIR/MEMORY.DMP.7z" "$WORK_DIR/mnt/Windows/MEMORY.DMP" >/dev/null
+          BSOD_HARVESTED="true"
+          echo "BSOD_DETECTED" > "$RESULTS_DIR/BSOD_DETECTED"
         fi
         cp "$WORK_DIR/mnt/ci/"dokan_install*.log "$RESULTS_DIR/" 2>/dev/null || true
+        cp -r "$WORK_DIR/mnt/ci/fstest-results" "$RESULTS_DIR/" 2>/dev/null || true
         sudo umount "$WORK_DIR/mnt" || true
       fi
       sudo qemu-nbd --disconnect /dev/nbd0 || true
@@ -170,8 +214,23 @@ BSOD_RC=0
 harvest_bsod_if_any || BSOD_RC=$?
 
 echo "=== Summary Timings ==="
-echo "VM boot to SSH: $((T_BOOT1 - T_BOOT0))s"
-echo "Test duration:  $((T_TEST1 - T_TEST0))s"
+echo "VM boot to SSH:  $((T_BOOT1 - T_BOOT0))s"
+echo "Test duration:   $((T_TEST1 - T_TEST0))s"
+echo "BSOD harvested:  ${BSOD_HARVESTED}"
+
+if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+  echo "bsod_detected=${BSOD_HARVESTED}" >> "$GITHUB_OUTPUT"
+fi
+
+if [[ "$SIMULATE_BSOD" == "true" ]]; then
+  if [[ "$BSOD_HARVESTED" == "true" ]]; then
+    echo "=== SIMULATED BSOD SELF-TEST: MEMORY.DMP.7z successfully harvested! ==="
+    exit 0
+  else
+    echo "ERROR: SIMULATE_BSOD=true was set, but no MEMORY.DMP was harvested!" >&2
+    exit 1
+  fi
+fi
 
 if [[ $TEST_RC -ne 0 ]] || [[ $BSOD_RC -ne 0 ]]; then
   exit 1
