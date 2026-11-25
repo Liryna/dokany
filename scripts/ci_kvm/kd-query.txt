@@ -1,0 +1,26 @@
+run_id=45610528887
+dump_artifact=kvm-results-server2025-shard1
+pdb_artifact=dokan-build-artifacts
+# Query 1: what was every CPU doing when PatchGuard's 0x109 hung, and what was the code at the pool address?
+vertarget
+.bugcheck
+!cpuinfo
+.echo ===== RUNNING THREADS ON ALL CPUS =====
+!running -it
+.echo ===== PCR / IRQL PER CPU =====
+!pcr 0
+!irql 0
+!irql 1
+!irql 2
+!irql 3
+.echo ===== CODE AND POOL AT THE INTERRUPTED RIP =====
+u ffffe783`39010e6a L10
+!pool ffffe783`39010e6a 2
+.echo ===== RAW STACK AROUND THE INTERRUPTED RSP =====
+dps fffff801`1ad03f00 L40
+.echo ===== VERIFIER STATE FOR DOKAN3 =====
+!verifier 0x1 dokan3.sys
+.echo ===== USER-MODE FS AND TEST PROCESSES (KERNEL STACKS) =====
+!process 0 0
+!process 0 7 mirror.exe
+!process 0 7 ifstest.exe

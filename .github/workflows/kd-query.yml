@@ -1,0 +1,84 @@
+name: KD Dump Query
+
+# Runs arbitrary kd.exe commands against a MEMORY.DMP.7z artifact from an earlier run.
+# Edit scripts/ci_kvm/kd-query.txt and push it to the 'kd-query' branch to execute.
+on:
+  push:
+    branches:
+      - kd-query
+    paths:
+      - 'scripts/ci_kvm/kd-query.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  query:
+    name: kd.exe query
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - name: Checkout dokany
+        uses: actions/checkout@v7
+
+      - name: Parse query file
+        id: q
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $lines = Get-Content scripts/ci_kvm/kd-query.txt
+          function Get-Key([string]$name, [string]$default) {
+            $hit = $lines | Where-Object { $_ -match "^$name=" } | Select-Object -First 1
+            if ($hit) { return ($hit -replace "^$name=", '').Trim() }
+            if ($default) { return $default }
+            throw "Missing '$name=' in kd-query.txt"
+          }
+          Add-Content $env:GITHUB_OUTPUT "run_id=$(Get-Key 'run_id' '')"
+          Add-Content $env:GITHUB_OUTPUT "dump_artifact=$(Get-Key 'dump_artifact' '')"
+          Add-Content $env:GITHUB_OUTPUT "pdb_artifact=$(Get-Key 'pdb_artifact' 'dokan-build-artifacts')"
+          $cmds = @($lines | Where-Object { $_ -and ($_ -notmatch '^\s*#') -and ($_ -notmatch '^[a-z_]+=') }) + @('q')
+          [System.IO.File]::WriteAllText("$env:RUNNER_TEMP\kd_commands.txt", ($cmds -join "`r`n") + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
+          Write-Host "kd commands:"; $cmds | ForEach-Object { Write-Host "  $_" }
+
+      - name: Download dump artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ steps.q.outputs.dump_artifact }}
+          path: ${{ runner.temp }}/dump
+          run-id: ${{ steps.q.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download symbols artifact (dokan3.pdb)
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ steps.q.outputs.pdb_artifact }}
+          path: ${{ runner.temp }}/symbols
+          run-id: ${{ steps.q.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Run kd.exe
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $kd = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\kd.exe'
+          $archive = Get-ChildItem "$env:RUNNER_TEMP\dump" -Recurse -Filter 'MEMORY.DMP.7z' | Select-Object -First 1
+          if (-not $archive) { throw "MEMORY.DMP.7z not found in artifact" }
+          & 7z x -y "-o$env:RUNNER_TEMP\dmp" $archive.FullName | Out-Null
+          $dmp = Get-ChildItem "$env:RUNNER_TEMP\dmp" -Filter 'MEMORY.DMP' | Select-Object -First 1
+          $symCache = "$env:RUNNER_TEMP\symcache"
+          New-Item -ItemType Directory -Force -Path $symCache, "$env:RUNNER_TEMP\out" | Out-Null
+          $symPath = "$env:RUNNER_TEMP\symbols;srv*$symCache*https://msdl.microsoft.com/download/symbols"
+          $out = @(& $kd -lines -z $dmp.FullName -y $symPath -i "$env:RUNNER_TEMP\symbols" -cf "$env:RUNNER_TEMP\kd_commands.txt" 2>&1)
+          [System.IO.File]::WriteAllText("$env:RUNNER_TEMP\out\kd-query-output.txt", ($out -join "`n"), (New-Object System.Text.UTF8Encoding($false)))
+          $out | Where-Object { $_ -notmatch 'not present in the dump file' } | ForEach-Object { Write-Host $_ }
+
+      - name: Upload kd output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: kd-query-output
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: ignore
+          retention-days: 7
