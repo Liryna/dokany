@@ -172,12 +172,23 @@ jobs:
         if: steps.cache-img.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-system-x86 qemu-utils genisoimage curl openssh-client
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils genisoimage curl openssh-client socat
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
           chmod +x scripts/ci_kvm/bake_image.sh
           ./scripts/ci_kvm/bake_image.sh "${{ matrix.os }}" "${{ runner.temp }}/kvm-images/${{ matrix.os }}"
+
+      - name: Upload bake diagnostics (screendumps + serial log) on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bake-diag-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/kvm-bake-${{ matrix.os }}/diag/
+            ${{ runner.temp }}/kvm-bake-${{ matrix.os }}/serial.log
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Save baked image (actions/cache applies zstd --long=30)
         if: steps.cache-img.outputs.cache-hit != 'true'

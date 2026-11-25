@@ -123,6 +123,10 @@ cat > "$SEED_DIR/autounattend.xml" <<EOF
           <WillShowUI>OnError</WillShowUI>
         </OSImage>
       </ImageInstall>
+      <DynamicUpdate>
+        <Enable>false</Enable>
+        <WillShowUI>Never</WillShowUI>
+      </DynamicUpdate>
       <UserData>
         <AcceptEula>true</AcceptEula>
         <FullName>DokanCI</FullName>
@@ -375,7 +379,21 @@ echo "=== [$(date -u +%T)] Starting unattended Windows Server Core install under
 T_BOOT=$(date +%s)
 tail -f "$SERIAL_LOG" &
 TAIL_PID=$!
-trap 'kill $TAIL_PID 2>/dev/null || true' EXIT
+
+# Periodic screendumps so a stalled unattended install is diagnosable (uploaded by the workflow on failure)
+DIAG_DIR="$WORK_DIR/diag"
+mkdir -p "$DIAG_DIR"
+MON_SOCK="$WORK_DIR/bake-mon.sock"
+rm -f "$MON_SOCK"
+(
+  i=0
+  while sleep 120; do
+    i=$((i + 1))
+    printf 'screendump %s/bake-%03d.ppm\n' "$DIAG_DIR" "$i" | socat - "UNIX-CONNECT:${MON_SOCK}" >/dev/null 2>&1 || true
+  done
+) &
+SHOT_PID=$!
+trap 'kill $TAIL_PID $SHOT_PID 2>/dev/null || true' EXIT
 
 # Timeout at 30 minutes (includes DISM /StartComponentCleanup /ResetBase)
 set +e
@@ -387,6 +405,8 @@ timeout 1800 qemu-system-x86_64 \
   -m 6G \
   -display none \
   -serial "file:${SERIAL_LOG}" \
+  -vga std \
+  -monitor "unix:${MON_SOCK},server,nowait" \
   -device ahci,id=ahci \
   -drive "file=$WORK_DIR/base-raw.qcow2,format=qcow2,if=none,id=hd0,cache=unsafe,discard=unmap" \
   -device ide-hd,drive=hd0,bus=ahci.0 \
@@ -400,7 +420,7 @@ timeout 1800 qemu-system-x86_64 \
 QEMU_RC=$?
 set -e
 
-kill "$TAIL_PID" 2>/dev/null || true
+kill "$TAIL_PID" "$SHOT_PID" 2>/dev/null || true
 T_END=$(date +%s)
 echo "=== [$(date -u +%T)] QEMU exited (rc=$QEMU_RC) after $((T_END - T_BOOT))s ==="
 
