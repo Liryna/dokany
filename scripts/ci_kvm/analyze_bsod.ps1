@@ -83,6 +83,8 @@ foreach ($archive in $dumps) {
             '!analyze -v'
             '.echo === STACK ==='
             'kP 30'
+            '.echo === LOCAL VARIABLES ==='
+            'dv /t /i /V'
             '.echo === DOKAN3 MODULE ==='
             'lmvm dokan3'
             '.echo === DRIVER VERIFIER ==='
@@ -90,7 +92,7 @@ foreach ($archive in $dumps) {
             'q'
         )
         [System.IO.File]::WriteAllText($kdScriptPath, ($kdScriptLines -join "`r`n") + "`r`n", (New-Object System.Text.UTF8Encoding($false)))
-        $rawOut = @(& $debuggerExe -z $dmpFile.FullName -y $symPath -cf $kdScriptPath 2>&1)
+        $rawOut = @(& $debuggerExe -lines -z $dmpFile.FullName -y $symPath -cf $kdScriptPath 2>&1)
         $kdRc = $LASTEXITCODE
         $fullText = ($rawOut -join "`n")
         [System.IO.File]::WriteAllText($analysisTxt, $fullText, (New-Object System.Text.UTF8Encoding($false)))

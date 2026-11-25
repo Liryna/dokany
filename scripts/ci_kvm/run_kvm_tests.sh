@@ -30,8 +30,6 @@ else
 fi
 
 chmod 600 "$SSH_KEY"
-rm -f "$OVERLAY_IMG"
-qemu-img create -f qcow2 -b "$BASE_IMG" -F qcow2 "$OVERLAY_IMG"
 
 : > "$SERIAL_LOG"
 QEMU_PID=""
@@ -43,24 +41,31 @@ cleanup() {
 }
 trap cleanup EXIT
 
+start_qemu() {
+  cleanup
+  rm -f "$OVERLAY_IMG" "${WORK_DIR}/mon.sock"
+  qemu-img create -f qcow2 -b "$BASE_IMG" -F qcow2 "$OVERLAY_IMG" >/dev/null
+  qemu-system-x86_64 \
+    -enable-kvm \
+    -machine q35,accel=kvm \
+    -cpu host,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time \
+    -smp 4 \
+    -m 6G \
+    -display none \
+    -vga std \
+    -monitor "unix:${WORK_DIR}/mon.sock,server,nowait" \
+    -serial "file:${SERIAL_LOG}" \
+    -device ahci,id=ahci \
+    -drive "file=${OVERLAY_IMG},format=qcow2,if=none,id=hd0,cache=writeback" \
+    -device ide-hd,drive=hd0,bus=ahci.0 \
+    -netdev user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:2222-:22 \
+    -device e1000e,netdev=net0 &
+  QEMU_PID=$!
+}
+
 echo "=== [$(date -u +%T)] Booting network-isolated KVM guest (restrict=on, shard=${SHARD}, simulate_bsod=${SIMULATE_BSOD}) ==="
 T_BOOT0=$(date +%s)
-qemu-system-x86_64 \
-  -enable-kvm \
-  -machine q35,accel=kvm \
-  -cpu host,hv_relaxed,hv_spinlocks=0x1fff,hv_vapic,hv_time \
-  -smp 4 \
-  -m 6G \
-  -display none \
-  -vga std \
-  -monitor "unix:${WORK_DIR}/mon.sock,server,nowait" \
-  -serial "file:${SERIAL_LOG}" \
-  -device ahci,id=ahci \
-  -drive "file=${OVERLAY_IMG},format=qcow2,if=none,id=hd0,cache=writeback" \
-  -device ide-hd,drive=hd0,bus=ahci.0 \
-  -netdev user,id=net0,restrict=on,hostfwd=tcp:127.0.0.1:2222-:22 \
-  -device e1000e,netdev=net0 &
-QEMU_PID=$!
+start_qemu
 
 SSH_OPTS=(
   -i "$SSH_KEY"
@@ -108,7 +113,13 @@ wait_for_ssh() {
   done
 }
 
-wait_for_ssh 180
+# Retry initial boot once if Windows stalls on early boot logo under nested KVM
+if ! wait_for_ssh 90; then
+  echo "WARNING: Initial guest boot did not reach SSH within 90s; resetting fresh CoW overlay and retrying once..." >&2
+  T_BOOT0=$(date +%s)
+  start_qemu
+  wait_for_ssh 150
+fi
 T_BOOT1=$(date +%s)
 echo "=== [$(date -u +%T)] Guest SSH ready in $((T_BOOT1 - T_BOOT0))s ==="
 

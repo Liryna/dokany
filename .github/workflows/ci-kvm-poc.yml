@@ -1,6 +1,9 @@
 name: CI PoC (GHA Build + KVM Driver Verifier)
 
 on:
+  push:
+    branches:
+      - master
   pull_request:
   workflow_dispatch:
     inputs:
@@ -27,8 +30,10 @@ concurrency:
 
 jobs:
   build:
-    name: Build & Test-Sign Dokan (Win32/x64/ARM64 + WiX + fsx)
+    name: Build & Test-Sign Dokan (Win32/x64/ARM64 + Cygwin/MSYS2 + WiX)
     runs-on: windows-2025-vs2026
+    outputs:
+      installer_version: ${{ steps.build-dokan.outputs.installer_version }}
     steps:
       - name: Checkout dokany
         uses: actions/checkout@v7
@@ -49,7 +54,32 @@ jobs:
           path: ${{ runner.temp }}/fstest-deps
           key: fstest-deps-${{ hashFiles('tests/fstest/deps.json') }}
 
-      - name: Build, test-sign, package WiX, and build test tools
+      - name: Install Cygwin & MSYS2 (UCRT64 + MINGW32) for dokan_fuse
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $cygCache = Join-Path $env:RUNNER_TEMP 'cygwin-pkg-cache'
+          $cygSetup = Join-Path $env:RUNNER_TEMP 'setup-x86_64.exe'
+          New-Item -ItemType Directory -Force -Path 'C:\cygwin64', $cygCache | Out-Null
+          Write-Host "Downloading and installing Cygwin build tools..."
+          Invoke-WebRequest -UseBasicParsing -Uri 'https://cygwin.com/setup-x86_64.exe' -OutFile $cygSetup
+          $cygProc = Start-Process -FilePath $cygSetup -ArgumentList @(
+            '-gqnNdO', '-R', 'C:/cygwin64',
+            '-s', 'http://mirrors.kernel.org/sourceware/cygwin/',
+            '-l', $cygCache,
+            '-P', 'cmake', '-P', 'make', '-P', 'gcc-core', '-P', 'gcc-g++', '-P', 'pkg-config'
+          ) -Wait -PassThru
+          if ($cygProc.ExitCode -ne 0) {
+            throw "Cygwin setup-x86_64.exe failed with exit code $($cygProc.ExitCode)"
+          }
+          Write-Host "Installing MSYS2 make + MINGW32 + UCRT64 GCC toolchains..."
+          & C:\msys64\usr\bin\bash.exe --login -c "pacman -Sy --needed --noconfirm msys2-keyring && pacman -S --needed --noconfirm make mingw-w64-i686-gcc mingw-w64-ucrt-x86_64-gcc"
+          if ($LASTEXITCODE -ne 0) {
+            throw "MSYS2 pacman install failed with exit code $LASTEXITCODE"
+          }
+
+      - name: Build, test-sign, package WiX + release zip, and build test tools
+        id: build-dokan
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
@@ -57,14 +87,23 @@ jobs:
             -BuildConfig Release `
             -BuildNumber "${{ github.run_number }}" `
             -OutputDir ci-artifacts `
-            -FsTestDepsCacheDir "${{ runner.temp }}\fstest-deps"
+            -ReleaseDir ci-release `
+            -FsTestDepsCacheDir "${{ runner.temp }}\fstest-deps" `
+            -RequireFuse
 
-      - name: Upload build artifacts
+      - name: Upload CI handoff artifacts (DokanSetup + PDB + test tools)
         uses: actions/upload-artifact@v7
         with:
           name: dokan-build-artifacts
           path: ci-artifacts/
           retention-days: 3
+
+      - name: Upload versioned release artifacts (DokanSetup-<ver>.exe + dokan-<ver>.zip)
+        uses: actions/upload-artifact@v7
+        with:
+          name: dokan-release-${{ steps.build-dokan.outputs.installer_version }}
+          path: ci-release/
+          retention-days: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && 90 || 7 }}
 
   kvm-image:
     name: Prepare KVM Image (${{ matrix.os }})

@@ -3,7 +3,9 @@ param(
     [string]$BuildConfig = 'Release',
     [string]$BuildNumber = '1',
     [string]$OutputDir = 'ci-artifacts',
-    [string]$FsTestDepsCacheDir = ''
+    [string]$ReleaseDir = 'ci-release',
+    [string]$FsTestDepsCacheDir = '',
+    [switch]$RequireFuse
 )
 
 $ErrorActionPreference = 'Stop'
@@ -65,12 +67,22 @@ try {
     Pop-Location
 }
 
-# 6. Build Dokan (Win32, x64, ARM64 + MSYS2 if available; Cygwin optional)
+# 6. Build Dokan (Win32, x64, ARM64 + Cygwin + MSYS2 dokan_fuse)
 $buildParts = @('win')
-if (Test-Path -LiteralPath 'C:\cygwin64\bin\bash.exe') {
+$hasCygwinTools = Test-Path -LiteralPath 'C:\cygwin64\bin\bash.exe'
+$hasMsys2Tools = (Test-Path -LiteralPath 'C:\msys64\ucrt64\bin\gcc.exe') -and (Test-Path -LiteralPath 'C:\msys64\mingw32\bin\gcc.exe') -and (Test-Path -LiteralPath 'C:\msys64\usr\bin\make.exe')
+if ($RequireFuse) {
+    if (-not $hasCygwinTools) {
+        throw "RequireFuse set, but Cygwin (C:\cygwin64\bin\bash.exe) was not found."
+    }
+    if (-not $hasMsys2Tools) {
+        throw "RequireFuse set, but MSYS2 toolchains (ucrt64/gcc, mingw32/gcc, usr/bin/make) were not found."
+    }
+}
+if ($hasCygwinTools) {
     $buildParts += 'cygwin'
 }
-if ((Test-Path -LiteralPath 'C:\msys64\ucrt64\bin\gcc.exe') -and (Test-Path -LiteralPath 'C:\msys64\mingw32\bin\gcc.exe')) {
+if ($hasMsys2Tools) {
     $buildParts += 'msys2'
 }
 Write-Host "Building Dokan parts: $($buildParts -join ', ')"
@@ -131,10 +143,13 @@ if ($hasDokanFsTest) {
     Write-Host "tests/fstest not present on this branch; skipping dokan_fstest.exe build."
 }
 
-# 11. Stage artifacts
+# 11. Stage CI handoff artifacts and AppVeyor-parity release packages
 $outAbs = Join-Path $repoRoot $OutputDir
-New-Item -ItemType Directory -Force -Path $outAbs | Out-Null
-Copy-Item -LiteralPath "$repoRoot\dokan_wix\Bootstrapper\bin\x86\$BuildConfig\DokanSetup.exe" -Destination "$outAbs\DokanSetup.exe" -Force
+$relAbs = Join-Path $repoRoot $ReleaseDir
+New-Item -ItemType Directory -Force -Path $outAbs, $relAbs | Out-Null
+
+$setupExe = "$repoRoot\dokan_wix\Bootstrapper\bin\x86\$BuildConfig\DokanSetup.exe"
+Copy-Item -LiteralPath $setupExe -Destination "$outAbs\DokanSetup.exe" -Force
 Copy-Item -LiteralPath "$fstoolsDir\src\fsx\fsx.exe" -Destination "$outAbs\fsx.exe" -Force
 Copy-Item -LiteralPath "$repoRoot\x64\$BuildConfig\Driver\dokan3.pdb" -Destination "$outAbs\dokan3.pdb" -Force
 Copy-Item -LiteralPath "$repoRoot\cert\DokanCA.cer" -Destination "$outAbs\DokanCA.cer" -Force
@@ -151,5 +166,28 @@ if ($hasDokanFsTest) {
     }
 }
 
-Write-Host "Staged build artifacts in ${outAbs}:"
+# Build AppVeyor-parity versioned release artifacts (DokanSetup-<version>.exe + dokan-<version>.zip)
+$versionedSetup = Join-Path $relAbs "DokanSetup-${installerVersion}.exe"
+$versionedZip = Join-Path $relAbs "dokan-${installerVersion}.zip"
+Copy-Item -LiteralPath $setupExe -Destination $versionedSetup -Force
+if (Test-Path -LiteralPath $versionedZip) {
+    Remove-Item -LiteralPath $versionedZip -Force
+}
+$sevenZip = (Get-Command 7z.exe -ErrorAction SilentlyContinue | Select-Object -First 1).Source
+if (-not $sevenZip -and (Test-Path 'C:\Program Files\7-Zip\7z.exe')) {
+    $sevenZip = 'C:\Program Files\7-Zip\7z.exe'
+}
+if (-not $sevenZip) {
+    throw "7z.exe not found; cannot build dokan-${installerVersion}.zip"
+}
+Write-Host "Packaging $versionedZip (Win32, x64, ARM64)..."
+Exec-External { & $sevenZip a -tzip $versionedZip Win32 x64 ARM64 | Out-Null }
+
+if ($env:GITHUB_OUTPUT) {
+    Add-Content -Path $env:GITHUB_OUTPUT -Value "installer_version=$installerVersion"
+}
+
+Write-Host "Staged CI artifacts in ${outAbs}:"
 Get-ChildItem -LiteralPath $outAbs | Format-Table Name, Length
+Write-Host "Staged release artifacts in ${relAbs}:"
+Get-ChildItem -LiteralPath $relAbs | Format-Table Name, Length
